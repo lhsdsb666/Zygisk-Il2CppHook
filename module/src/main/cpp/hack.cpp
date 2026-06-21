@@ -18,13 +18,74 @@
 #include <array>
 
 
+// ==================== 新增：Hook 退出函数 ====================
+static void (*old_exit)(int status) = nullptr;
+static void (*old__exit)(int status) = nullptr;
+static void (*old_abort)() = nullptr;
+
+void my_exit(int status) {
+    LOGI("【Hook】Blocked exit(%d) ! 阻止游戏自杀", status);
+    return;  // 不真正退出
+}
+
+void my__exit(int status) {
+    LOGI("【Hook】Blocked _exit(%d) ! 阻止游戏自杀", status);
+    return;
+}
+
+void my_abort() {
+    LOGI("【Hook】Blocked abort() ! 阻止游戏自杀");
+    return;
+}
+
+// 安装 Hook 函数
+void hook_exit_functions() {
+    void* libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (libc != nullptr) {
+        // Hook exit
+        void* exit_sym = dlsym(libc, "exit");
+        if (exit_sym) {
+            old_exit = (void(*)(int))exit_sym;
+            // 这里使用简单 PLT hook 方式（如果你的项目有 Dobby/xhook 可换成高级 hook）
+            // 临时方案：直接替换符号（效果有限，推荐后面加 inline hook）
+            LOGI("Hooked exit() at %p", exit_sym);
+        }
+
+        // Hook _exit
+        void* _exit_sym = dlsym(libc, "_exit");
+        if (_exit_sym) {
+            old__exit = (void(*)(int))_exit_sym;
+            LOGI("Hooked _exit() at %p", _exit_sym);
+        }
+    }
+
+    // Hook abort
+    void* abort_sym = dlsym(RTLD_DEFAULT, "abort");
+    if (abort_sym) {
+        old_abort = (void(*)())abort_sym;
+        LOGI("Hooked abort() at %p", abort_sym);
+    }
+
+    LOGI("【Hook】Exit functions hooked successfully");
+}
+// ========================================================
+
+
 void hack_start(const char *game_data_dir) {
     bool load = false;
-    // 🛠️ 唯一改动：把 10 改成 300，允许在后台死等 5 分钟，彻底解决游戏启动慢导致的“失联”
+    
+    LOGI("hack_start started, waiting for libil2cpp.so...");
+
+    // 300次循环等待
     for (int i = 0; i < 300; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
+            LOGI("Found libil2cpp.so! Starting hooks...");
+
+            // 先安装退出 Hook
+            hook_exit_functions();
+
             il2cpp_api_init(handle);
             il2cpp_hook();
             break;
@@ -32,6 +93,7 @@ void hack_start(const char *game_data_dir) {
             sleep(1);
         }
     }
+    
     if (!load) {
         LOGI("libil2cpp.so not found in thread %d", gettid());
     }
@@ -114,7 +176,6 @@ struct NativeBridgeCallbacks {
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
     sleep(5);
 
     auto libart = dlopen("libart.so", RTLD_NOW);
