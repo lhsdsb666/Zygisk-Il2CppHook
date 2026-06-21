@@ -17,6 +17,8 @@
 #include <linux/unistd.h>
 #include <array>
 
+// ===== 核心黑科技：直接前置声明 Dobby 函数，免去引入 dobby.h 的麻烦，防止 GitHub 报找不到头文件错误 =====
+extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
 // ==================== 新增：Hook 退出函数 ====================
 static void (*old_exit)(int status) = nullptr;
@@ -25,17 +27,24 @@ static void (*old_abort)() = nullptr;
 
 void my_exit(int status) {
     LOGI("【Hook】Blocked exit(%d) ! 阻止游戏自杀", status);
-    return;  // 不真正退出
+    // 强行让反作弊线程陷入无限休眠，卡死反作弊
+    while (true) {
+        sleep(3600);
+    }
 }
 
 void my__exit(int status) {
     LOGI("【Hook】Blocked _exit(%d) ! 阻止游戏自杀", status);
-    return;
+    while (true) {
+        sleep(3600);
+    }
 }
 
 void my_abort() {
     LOGI("【Hook】Blocked abort() ! 阻止游戏自杀");
-    return;
+    while (true) {
+        sleep(3600);
+    }
 }
 
 // 安装 Hook 函数
@@ -45,16 +54,14 @@ void hook_exit_functions() {
         // Hook exit
         void* exit_sym = dlsym(libc, "exit");
         if (exit_sym) {
-            old_exit = (void(*)(int))exit_sym;
-            // 这里使用简单 PLT hook 方式（如果你的项目有 Dobby/xhook 可换成高级 hook）
-            // 临时方案：直接替换符号（效果有限，推荐后面加 inline hook）
+            DobbyHook(exit_sym, (void*)my_exit, (void**)&old_exit);
             LOGI("Hooked exit() at %p", exit_sym);
         }
 
         // Hook _exit
         void* _exit_sym = dlsym(libc, "_exit");
         if (_exit_sym) {
-            old__exit = (void(*)(int))_exit_sym;
+            DobbyHook(_exit_sym, (void*)my__exit, (void**)&old__exit);
             LOGI("Hooked _exit() at %p", _exit_sym);
         }
     }
@@ -62,7 +69,7 @@ void hook_exit_functions() {
     // Hook abort
     void* abort_sym = dlsym(RTLD_DEFAULT, "abort");
     if (abort_sym) {
-        old_abort = (void(*)())abort_sym;
+        DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
         LOGI("Hooked abort() at %p", abort_sym);
     }
 
