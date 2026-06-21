@@ -1,5 +1,6 @@
 //
 // Created by Perfare on 2020/7/4.
+// Modified for Unity 6 Text Hooking
 //
 
 #include "hack.h"
@@ -17,66 +18,74 @@
 #include <linux/unistd.h>
 #include <array>
 
-// ===== 核心黑科技：直接前置声明 Dobby 函数，免去引入 dobby.h 的麻烦，防止 GitHub 报找不到头文件错误 =====
+// ===== 核心黑科技：直接前置声明 Dobby 函数 =====
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
-// ==================== 新增：Hook 退出函数 ====================
+// ==================== 新增：获取模块基地址的绝对安全函数 ====================
+uintptr_t get_module_base(const char* module_name) {
+    uintptr_t base = 0;
+    char line[512];
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (fp != nullptr) {
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, module_name) != nullptr) {
+                base = strtoul(line, nullptr, 16);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    return base;
+}
+
+// ==================== 新增：Hook 退出函数（防自杀） ====================
 static void (*old_exit)(int status) = nullptr;
 static void (*old__exit)(int status) = nullptr;
 static void (*old_abort)() = nullptr;
 
 void my_exit(int status) {
     LOGI("【Hook】Blocked exit(%d) ! 阻止游戏自杀", status);
-    // 强行让反作弊线程陷入无限休眠，卡死反作弊
-    while (true) {
-        sleep(3600);
-    }
+    while (true) { sleep(3600); }
 }
 
 void my__exit(int status) {
     LOGI("【Hook】Blocked _exit(%d) ! 阻止游戏自杀", status);
-    while (true) {
-        sleep(3600);
-    }
+    while (true) { sleep(3600); }
 }
 
 void my_abort() {
     LOGI("【Hook】Blocked abort() ! 阻止游戏自杀");
-    while (true) {
-        sleep(3600);
-    }
+    while (true) { sleep(3600); }
 }
 
-// 安装 Hook 函数
 void hook_exit_functions() {
     void* libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
     if (libc != nullptr) {
-        // Hook exit
         void* exit_sym = dlsym(libc, "exit");
-        if (exit_sym) {
-            DobbyHook(exit_sym, (void*)my_exit, (void**)&old_exit);
-            LOGI("Hooked exit() at %p", exit_sym);
-        }
-
-        // Hook _exit
+        if (exit_sym) DobbyHook(exit_sym, (void*)my_exit, (void**)&old_exit);
         void* _exit_sym = dlsym(libc, "_exit");
-        if (_exit_sym) {
-            DobbyHook(_exit_sym, (void*)my__exit, (void**)&old__exit);
-            LOGI("Hooked _exit() at %p", _exit_sym);
-        }
+        if (_exit_sym) DobbyHook(_exit_sym, (void*)my__exit, (void**)&old__exit);
     }
-
-    // Hook abort
     void* abort_sym = dlsym(RTLD_DEFAULT, "abort");
-    if (abort_sym) {
-        DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
-        LOGI("Hooked abort() at %p", abort_sym);
-    }
-
+    if (abort_sym) DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
     LOGI("【Hook】Exit functions hooked successfully");
 }
-// ========================================================
 
+// ==================== 核心新增：TextMeshPro 文本拦截器 ====================
+// 对应你截图 1000064320.jpg 中的 public virtual Void set_text(String value)
+static void (*old_set_text)(void* __this, void* il2cpp_string) = nullptr;
+
+void my_set_text(void* __this, void* il2cpp_string) {
+    // 只要游戏调用这个函数，就会在这里被我们抓个正着
+    // 为了防止 Unity 6 的字符串结构不稳定导致闪退，我们先打印指针地址确保 Hook 绝对稳定
+    if (il2cpp_string != nullptr) {
+        LOGI("【文本拦截】游戏正在渲染文字，字符串内存地址: %p", il2cpp_string);
+    }
+    
+    // 放行，让游戏照常显示文字
+    old_set_text(__this, il2cpp_string);
+}
+// =========================================================================
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
@@ -90,13 +99,28 @@ void hack_start(const char *game_data_dir) {
             load = true;
             LOGI("Found libil2cpp.so! Starting hooks...");
 
-            // 先安装退出 Hook
+            // 1. 先安装退出 Hook
             hook_exit_functions();
 
-            // ====== 核心修改：已关闭针对旧版 Unity 的全自动 API 扫描，防止 Unity 6 引擎闪退 ======
+            // 2. 获取 libil2cpp.so 的安全内存基地址
+            uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
+            if (il2cpp_base != 0) {
+                LOGI("【成功】安全获取到 il2cpp 基地址: 0x%lx", il2cpp_base);
+
+                // 3. 根据你截图的 RVA 0xb5b099c 计算出函数在内存中的绝对地址
+                unsigned long set_text_RVA = 0xb5b099c; 
+                void* set_text_addr = (void*)(il2cpp_base + set_text_RVA);
+
+                // 4. 精准打击，挂钩 set_text
+                DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
+                LOGI("【成功】TextMeshPro::set_text 挂钩完成！地址: %p", set_text_addr);
+            } else {
+                LOGE("【失败】未能获取到 il2cpp 基地址");
+            }
+
+            // 已关闭针对旧版 Unity 的全自动 API 扫描，防止 Unity 6 引擎闪退
             // il2cpp_api_init(handle);
             // il2cpp_hook();
-            // ===============================================================================
             
             break;
         } else {
@@ -166,11 +190,8 @@ static std::string GetNativeBridgeLibrary() {
 struct NativeBridgeCallbacks {
     uint32_t version;
     void *initialize;
-
     void *(*loadLibrary)(const char *libpath, int flag);
-
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
-
     void *isSupported;
     void *getAppEnv;
     void *isCompatibleWith;
@@ -181,53 +202,30 @@ struct NativeBridgeCallbacks {
     void *initAnonymousNamespace;
     void *createNamespace;
     void *linkNamespaces;
-
     void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
     sleep(5);
-
     auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
-                                                                             "JNI_GetCreatedJavaVMs");
-    LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
+    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
     JavaVM *vms_buf[1];
     JavaVM *vms;
     jsize num_vms;
     jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
-    if (status == JNI_OK && num_vms > 0) {
-        vms = vms_buf[0];
-    } else {
-        LOGE("GetCreatedJavaVMs error");
-        return false;
-    }
+    if (status == JNI_OK && num_vms > 0) { vms = vms_buf[0]; } else { return false; }
 
     auto lib_dir = GetLibDir(vms);
-    if (lib_dir.empty()) {
-        LOGE("GetLibDir error");
-        return false;
-    }
-    if (lib_dir.find("/lib/x86") != std::string::npos) {
-        LOGI("no need NativeBridge");
-        munmap(data, length);
-        return false;
-    }
+    if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) { return false; }
 
     auto nb = dlopen("libhoudini.so", RTLD_NOW);
     if (!nb) {
         auto native_bridge = GetNativeBridgeLibrary();
-        LOGI("native bridge: %s", native_bridge.data());
         nb = dlopen(native_bridge.data(), RTLD_NOW);
     }
     if (nb) {
-        LOGI("nb %p", nb);
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
-            LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
-            LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
-            LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
-
             int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
             ftruncate(fd, (off_t) length);
             void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
@@ -236,7 +234,6 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
             munmap(data, length);
             char path[PATH_MAX];
             snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-            LOGI("arm path %s", path);
 
             void *arm_handle;
             if (api_level >= 26) {
@@ -245,11 +242,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
                 arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
             }
             if (arm_handle) {
-                LOGI("arm handle %p", arm_handle);
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
-                                                                                  "JNI_OnLoad",
-                                                                                  nullptr, 0);
-                LOGI("JNI_OnLoad %p", init);
+                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle, "JNI_OnLoad", nullptr, 0);
                 init(vms, (void *) game_data_dir);
                 return true;
             }
@@ -260,10 +253,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 }
 
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("hack thread: %d", gettid());
     int api_level = android_get_device_api_level();
-    LOGI("api level: %d", api_level);
-
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
 #endif
@@ -274,12 +264,10 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 }
 
 #if defined(__arm__) || defined(__aarch64__)
-
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *) reserved;
     std::thread hack_thread(hack_start, game_data_dir);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
-
 #endif
