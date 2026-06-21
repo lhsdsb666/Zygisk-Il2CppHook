@@ -66,12 +66,14 @@ void il2cpp_api_init(void *handle) {
     il2cpp_thread_attach(domain);
 }
 
- Il2CppObject * getFieldVal(Il2CppObject * obj,char * name){
+// =============================================================================
+// [清理] 以下为原存储库自带的过期硬编码 Hook 示例，因语法不兼容且不再需要，已进行安全注释
+// =============================================================================
+/*
+ Il2CppObject * getFieldVal(Il2CppObject * obj, const char * name){
      auto field = il2cpp_class_get_field_from_name(obj->klass, name);
      return  il2cpp_field_get_value_object(field,obj);
 }
-
-
 
 static const MethodInfo * getData;
 static const MethodInfo * hook1;
@@ -87,37 +89,29 @@ install_hook_name(func1,uint8_t,void * p){
     return 0;
 }
 
-
 install_hook_name(func2,uint8_t,void * p){
     return fake_func1(p);
 }
 
-
-
 install_hook_name(enemy,int32_t,Il2CppObject * p){
     return 0;
 }
+*/
 
 void il2cpp_hook() {
+    // 自动执行一次内存 Dump，我们的核心 Hook 现在在 hack.cpp 中通过 Dobby 单独处理
     il2cpp_dump();
-    install_hook_func1(reinterpret_cast<void *>(hook1->methodPointer));
-    install_hook_func2(reinterpret_cast<void *>(hook2->methodPointer));
 }
 
 
 void dump_class(Il2CppClass *klass) {
+    // 这里保留核心的类名获取，原本针对旧游戏的硬编码判定已清除
     auto classNamespace = il2cpp_class_get_namespace(klass);
     auto className = il2cpp_class_get_name(klass);
-    if (strcmp("BasicSkill",className) == 0 && strcmp("Torappu.Battle",classNamespace) == 0){
-        LOGI("dump class %s",className);
-        getData = il2cpp_class_get_method_from_name(klass,"get_data",0);
-        hook1 = il2cpp_class_get_method_from_name(klass,"get_canSkipReduceSp",0);
-        hook2 = il2cpp_class_get_method_from_name(klass,"get_canCastWithNoSp",0);
-    }
-    if (strcmp("Enemy",className) == 0  && strcmp("Torappu.Battle",classNamespace) == 0){
-        LOGI("dump class %s",className);
-        auto  lifeReduce = il2cpp_class_get_method_from_name(klass,"get_lifePointReduce",0);
-        install_hook_enemy(reinterpret_cast<void *>(lifeReduce->methodPointer));
+    
+    if (className != nullptr && classNamespace != nullptr) {
+        // 如果以后想在日志里查看游戏都加载了哪些类，可以取消下面这行的注释：
+        // LOGI("发现游戏类: %s.%s", classNamespace, className);
     }
 }
 
