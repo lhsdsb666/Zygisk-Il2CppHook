@@ -17,6 +17,28 @@
 #include <linux/unistd.h>
 #include <array>
 
+// 🛠️ 新增：引入 Dobby 手术刀工具头文件，用来挂载 Hook
+#include "dobby.h" 
+
+// ================= [ 汉化 Hook 核心逻辑开始 ] =================
+
+// 1. 声明原函数的“替身指针”，用于维持游戏正常运行
+void (*old_set_text)(void* thiz, void* value) = nullptr;
+
+// 2. 编写我们自己的拦截函数
+void my_set_text(void* thiz, void* value) {
+    if (value != nullptr) {
+        // 在 Logcat 控制台打印一句日志，证明我们成功拦截到了游戏文字渲染！
+        LOGI("【汉化日志】成功拦截到了文字渲染请求！");
+        
+        // 💡 以后我们的“韩文转中文”翻译字典和替换逻辑，就会写在这里。
+    }
+    
+    // 3. 拦截完后，必须把数据正常传回给原函数，否则游戏界面会没有字或闪退
+    old_set_text(thiz, value);
+}
+
+// ================= [ 汉化 Hook 核心逻辑结束 ] =================
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
@@ -26,6 +48,27 @@ void hack_start(const char *game_data_dir) {
             load = true;
             il2cpp_api_init(handle);
             il2cpp_hook();
+
+            // 🛠️ 新增：在游戏启动、引擎初始化完成的地方，强行插入我们的狙击手
+            LOGI("【汉化日志】libil2cpp.so 已加载，开始计算绝对地址...");
+            
+            // A. 利用已知的系统函数，反向获取 libil2cpp.so 在手机内存里的实际动态基地址
+            void *il2cpp_init_addr = xdl_sym(handle, "il2cpp_init", nullptr);
+            if (il2cpp_init_addr) {
+                Dl_info info;
+                if (dladdr(il2cpp_init_addr, &info)) {
+                    uintptr_t base_addr = (uintptr_t)info.dli_fbase;
+                    LOGI("【汉化日志】成功获取到游戏基地址: %p", (void*)base_addr);
+                    
+                    // B. 动态基地址 + 你的黄金门牌号 (0xb5b099c) = 该函数此时此刻在内存里的绝对地址
+                    uintptr_t target_addr = base_addr + 0xb5b099c; 
+                    
+                    // C. 让 Dobby 动手术：把目标绝对地址导流到我们的 my_set_text 函数里
+                    DobbyHook((void*)target_addr, (void*)my_set_text, (void**)&old_set_text);
+                    LOGI("【汉化日志】狙击手已在绝对地址 %p 就位！", (void*)target_addr);
+                }
+            }
+            
             break;
         } else {
             sleep(1);
@@ -113,7 +156,6 @@ struct NativeBridgeCallbacks {
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
     sleep(5);
 
     auto libart = dlopen("libart.so", RTLD_NOW);
