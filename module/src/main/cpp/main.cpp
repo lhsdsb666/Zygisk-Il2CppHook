@@ -1,282 +1,80 @@
-//
-// Created by Perfare on 2020/7/4.
-//
-
-#include "hack.h"
-#include "il2cpp_dump.h"
-#include "log.h"
-#include "xdl.h"
-#include "dobby.h"  // ===== 新增：引入 Dobby Hook 框架 =====
 #include <cstring>
-#include <cstdio>
-#include <unistd.h>
-#include <sys/system_properties.h>
-#include <dlfcn.h>
-#include <jni.h>
 #include <thread>
+#include <fcntl.h>
 #include <sys/mman.h>
-#include <linux/unistd.h>
-#include <array>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <cinttypes>
+#include "hack.h"
+#include "zygisk.hpp"
+#include "game.h"
+#include "log.h"
 
+using zygisk::Api;
+using zygisk::AppSpecializeArgs;
+using zygisk::ServerSpecializeArgs;
 
-// ==================== 核心修正：真正实现防自杀 Hook ====================
-static void (*old_exit)(int status) = nullptr;
-static void (*old__exit)(int status) = nullptr;
-static void (*old_abort)() = nullptr;
-
-void my_exit(int status) {
-    LOGI("【Hook 拦截】反作弊尝试调用 exit(%d) 自杀！已成功拦截并挂起该线程！", status);
-    // 不能 return，直接让反作弊线程无限无限休眠，从而将其强行卡死
-    while (true) {
-        sleep(3600);
+class MyModule : public zygisk::ModuleBase {
+public:
+    void onLoad(Api *api, JNIEnv *env) override {
+        this->api = api;
+        this->env = env;
     }
-}
 
-void my__exit(int status) {
-    LOGI("【Hook 拦截】反作弊尝试调用 _exit(%d) 自杀！已成功拦截并挂起该线程！", status);
-    while (true) {
-        sleep(3600);
+    void preAppSpecialize(AppSpecializeArgs *args) override {
+        auto package_name = env->GetStringUTFChars(args->nice_name, nullptr);
+        auto app_data_dir = env->GetStringUTFChars(args->app_data_dir, nullptr);
+        preSpecialize(package_name, app_data_dir);
+        env->ReleaseStringUTFChars(args->nice_name, package_name);
+        env->ReleaseStringUTFChars(args->app_data_dir, app_data_dir);
     }
-}
 
-void my_abort() {
-    LOGI("【Hook 拦截】反作弊尝试调用 abort() 自杀！已成功拦截并挂起该线程！");
-    while (true) {
-        sleep(3600);
-    }
-}
-
-// 安装 Hook 函数
-void hook_exit_functions() {
-    void* libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
-    if (libc != nullptr) {
-        // 1. 真正 Hook exit
-        void* exit_sym = dlsym(libc, "exit");
-        if (exit_sym) {
-            DobbyHook(exit_sym, (void*)my_exit, (void**)&old_exit);
-            LOGI("【Dobby 注入】exit() 拦截点安装成功 at %p", exit_sym);
-        }
-
-        // 2. 真正 Hook _exit
-        void* _exit_sym = dlsym(libc, "_exit");
-        if (_exit_sym) {
-            DobbyHook(_exit_sym, (void*)my__exit, (void**)&old__exit);
-            LOGI("【Dobby 注入】_exit() 拦截点安装成功 at %p", _exit_sym);
-        }
-
-        // 3. 真正 Hook abort
-        void* abort_sym = dlsym(libc, "abort");
-        if (abort_sym) {
-            DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
-            LOGI("【Dobby 注入】abort() 拦截点安装成功 at %p", abort_sym);
-        }
-    } else {
-        LOGE("【Hook 失败】无法打开 libc.so");
-    }
-    LOGI("【Hook】防自杀拦截层部署完毕");
-}
-// ========================================================
-
-
-void hack_start(const char *game_data_dir) {
-    bool load = false;
-    
-    LOGI("hack_start started, waiting for libil2cpp.so...");
-
-    // 300次循环等待
-    for (int i = 0; i < 300; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            load = true;
-            LOGI("Found libil2cpp.so! Starting hooks...");
-
-            // 先安装退出 Hook，全面保护接下来的 Hook 行为
-            hook_exit_functions();
-
-            il2cpp_api_init(handle);
-            il2cpp_hook();
-            break;
-        } else {
-            sleep(1);
+    void postAppSpecialize(const AppSpecializeArgs *) override {
+        if (enable_hack) {
+            std::thread hack_thread(hack_prepare, game_data_dir, data, length);
+            hack_thread.detach();
         }
     }
-    
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
-    }
-}
 
-std::string GetLibDir(JavaVM *vms) {
-    JNIEnv *env = nullptr;
-    vms->AttachCurrentThread(&env, nullptr);
-    jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
-    if (activity_thread_clz != nullptr) {
-        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
-                                                                "currentApplication",
-                                                                "()Landroid/app/Application;");
-        if (currentApplicationId) {
-            jobject application = env->CallStaticObjectMethod(activity_thread_clz,
-                                                              currentApplicationId);
-            jclass application_clazz = env->GetObjectClass(application);
-            if (application_clazz) {
-                jmethodID get_application_info = env->GetMethodID(application_clazz,
-                                                                  "getApplicationInfo",
-                                                                  "()Landroid/content/pm/ApplicationInfo;");
-                if (get_application_info) {
-                    jobject application_info = env->CallObjectMethod(application,
-                                                                     get_application_info);
-                    jfieldID native_library_dir_id = env->GetFieldID(
-                            env->GetObjectClass(application_info), "nativeLibraryDir",
-                            "Ljava/lang/String;");
-                    if (native_library_dir_id) {
-                        auto native_library_dir_jstring = (jstring) env->GetObjectField(
-                                application_info, native_library_dir_id);
-                        auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        LOGI("lib dir %s", path);
-                        std::string lib_dir(path);
-                        env->ReleaseStringUTFChars(native_library_dir_jstring, path);
-                        return lib_dir;
-                    } else {
-                        LOGE("nativeLibraryDir not found");
-                    }
-                } else {
-                    LOGE("getApplicationInfo not found");
-                }
+private:
+    Api *api;
+    JNIEnv *env;
+    bool enable_hack;
+    char *game_data_dir;
+    void *data;
+    size_t length;
+
+    void preSpecialize(const char *package_name, const char *app_data_dir) {
+    if (package_name != nullptr && strstr(package_name, "trickcal") != nullptr) {
+        LOGI("detect game: %s", package_name);
+        enable_hack = true;
+            game_data_dir = new char[strlen(app_data_dir) + 1];
+            strcpy(game_data_dir, app_data_dir);
+
+#if defined(__i386__)
+            auto path = "zygisk/armeabi-v7a.so";
+#endif
+#if defined(__x86_64__)
+            auto path = "zygisk/arm64-v8a.so";
+#endif
+#if defined(__i386__) || defined(__x86_64__)
+            int dirfd = api->getModuleDir();
+            int fd = openat(dirfd, path, O_RDONLY);
+            if (fd != -1) {
+                struct stat sb{};
+                fstat(fd, &sb);
+                length = sb.st_size;
+                data = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
+                close(fd);
             } else {
-                LOGE("application class not found");
+                LOGW("Unable to open arm file");
             }
+#endif
         } else {
-            LOGE("currentApplication not found");
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
         }
-    } else {
-        LOGE("ActivityThread not found");
     }
-    return {};
-}
-
-static std::string GetNativeBridgeLibrary() {
-    auto value = std::array<char, PROP_VALUE_MAX>();
-    __system_property_get("ro.dalvik.vm.native.bridge", value.data());
-    return {value.data()};
-}
-
-struct NativeBridgeCallbacks {
-    uint32_t version;
-    void *initialize;
-
-    void *(*loadLibrary)(const char *libpath, int flag);
-
-    void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
-
-    void *isSupported;
-    void *getAppEnv;
-    void *isCompatibleWith;
-    void *getSignalHandler;
-    void *unloadLibrary;
-    void *getError;
-    void *isPathSupported;
-    void *initAnonymousNamespace;
-    void *createNamespace;
-    void *linkNamespaces;
-
-    void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
-bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    sleep(5);
-
-    auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
-                                                                             "JNI_GetCreatedJavaVMs");
-    LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
-    JavaVM *vms_buf[1];
-    JavaVM *vms;
-    jsize num_vms;
-    jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
-    if (status == JNI_OK && num_vms > 0) {
-        vms = vms_buf[0];
-    } else {
-        LOGE("GetCreatedJavaVMs error");
-        return false;
-    }
-
-    auto lib_dir = GetLibDir(vms);
-    if (lib_dir.empty()) {
-        LOGE("GetLibDir error");
-        return false;
-    }
-    if (lib_dir.find("/lib/x86") != std::string::npos) {
-        LOGI("no need NativeBridge");
-        munmap(data, length);
-        return false;
-    }
-
-    auto nb = dlopen("libhoudini.so", RTLD_NOW);
-    if (!nb) {
-        auto native_bridge = GetNativeBridgeLibrary();
-        LOGI("native bridge: %s", native_bridge.data());
-        nb = dlopen(native_bridge.data(), RTLD_NOW);
-    }
-    if (nb) {
-        LOGI("nb %p", nb);
-        auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
-        if (callbacks) {
-            LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
-            LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
-            LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
-
-            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
-            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
-            memcpy(mem, data, length);
-            munmap(mem, length);
-            munmap(data, length);
-            char path[PATH_MAX];
-            snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-            LOGI("arm path %s", path);
-
-            void *arm_handle;
-            if (api_level >= 26) {
-                arm_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
-            } else {
-                arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
-            }
-            if (arm_handle) {
-                LOGI("arm handle %p", arm_handle);
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
-                                                                                  "JNI_OnLoad",
-                                                                                  nullptr, 0);
-                LOGI("JNI_OnLoad %p", init);
-                init(vms, (void *) game_data_dir);
-                return true;
-            }
-            close(fd);
-        }
-    }
-    return false;
-}
-
-void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("hack thread: %d", gettid());
-    int api_level = android_get_device_api_level();
-    LOGI("api level: %d", api_level);
-
-#if defined(__i386__) || defined(__x86_64__)
-    if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
-#endif
-        hack_start(game_data_dir);
-#if defined(__i386__) || defined(__x86_64__)
-    }
-#endif
-}
-
-#if defined(__arm__) || defined(__aarch64__)
-
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    auto game_data_dir = (const char *) reserved;
-    std::thread hack_thread(hack_start, game_data_dir);
-    hack_thread.detach();
-    return JNI_VERSION_1_6;
-}
-
-#endif
+REGISTER_ZYGISK_MODULE(MyModule)
