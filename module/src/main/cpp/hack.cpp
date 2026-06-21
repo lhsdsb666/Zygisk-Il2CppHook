@@ -42,9 +42,40 @@ void my_set_text(void* thiz, void* value) {
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
-    for (int i = 0; i < 10; i++) {
+    // 🛠️ 修改：把 10 改成 300！也就是允许它在后台死等 300 秒（5分钟）
+    for (int i = 0; i < 300; i++) { 
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
+            load = true;
+            il2cpp_api_init(handle);
+            il2cpp_hook();
+
+            // 这里就是你加的黄金日志
+            LOGI("【汉化日志】libil2cpp.so 已加载，开始计算绝对地址...");
+            
+            void *il2cpp_init_addr = xdl_sym(handle, "il2cpp_init", nullptr);
+            if (il2cpp_init_addr) {
+                Dl_info info;
+                if (dladdr(il2cpp_init_addr, &info)) {
+                    uintptr_t base_addr = (uintptr_t)info.dli_fbase;
+                    LOGI("【汉化日志】成功获取到游戏基地址: %p", (void*)base_addr);
+                    
+                    uintptr_t target_addr = base_addr + 0xb5b099c; 
+                    
+                    DobbyHook((void*)target_addr, (void*)my_set_text, (void**)&old_set_text);
+                    LOGI("【汉化日志】狙击手已在绝对地址 %p 就位！", (void*)target_addr);
+                }
+            }
+            break;
+        } else {
+            // 没找到就每秒探查一次
+            sleep(1); 
+        }
+    }
+    if (!load) {
+        LOGI("libil2cpp.so not found in thread %d", gettid());
+    }
+}
             load = true;
             il2cpp_api_init(handle);
             il2cpp_hook();
