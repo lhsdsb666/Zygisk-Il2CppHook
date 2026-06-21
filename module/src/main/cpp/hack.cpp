@@ -17,6 +17,7 @@
 #include <linux/unistd.h>
 #include <array>
 #include <cstdint> // 新增：确保 uintptr_t 全局可用，防止编译报错
+#include <string>  // 新增：确保 std::string 和字符串操作可用
 
 // ===== 核心黑科技：直接前置声明 Dobby 函数，免去引入 dobby.h 的麻烦，防止 GitHub 报找不到头文件错误 =====
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
@@ -95,12 +96,57 @@ void hook_exit_functions() {
 }
 
 // ==================== 核心新增：TextMeshPro 文本拦截器 ====================
-static void (*old_set_text)(void* __this, void* il2cpp_string) = nullptr;
+// 1. 定义 Unity 底层的 C# 字符串结构体
+struct MyIl2CppString {
+    void* klass;
+    void* monitor;
+    int32_t length;
+    char16_t chars[0]; 
+};
 
-void my_set_text(void* __this, void* il2cpp_string) {
+// 2. UTF-16 转 UTF-8 转换函数（防止韩文/中文在 logcat 中乱码）
+std::string utf16_to_utf8(const char16_t* utf16, int len) {
+    std::string utf8;
+    for (int i = 0; i < len; ++i) {
+        unsigned long cp = utf16[i];
+        if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < len) {
+            unsigned long trail = utf16[i + 1];
+            if (trail >= 0xdc00 && trail <= 0xdfff) {
+                cp = (cp - 0xd800) << 10 | (trail - 0xdc00);
+                cp += 0x10000;
+                i++;
+            }
+        }
+        if (cp <= 0x7f) utf8 += (char)cp;
+        else if (cp <= 0x7ff) {
+            utf8 += (char)(0xc0 | (cp >> 6));
+            utf8 += (char)(0x80 | (cp & 0x3f));
+        } else if (cp <= 0xffff) {
+            utf8 += (char)(0xe0 | (cp >> 12));
+            utf8 += (char)(0x80 | ((cp >> 6) & 0x3f));
+            utf8 += (char)(0x80 | (cp & 0x3f));
+        } else {
+            utf8 += (char)(0xf0 | (cp >> 18));
+            utf8 += (char)(0x80 | ((cp >> 12) & 0x3f));
+            utf8 += (char)(0x80 | ((cp >> 6) & 0x3f));
+            utf8 += (char)(0x80 | (cp & 0x3f));
+        }
+    }
+    return utf8;
+}
+
+static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
+
+void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     // 只要游戏调用这个函数，就会在这里被我们抓个正着
-    if (il2cpp_string != nullptr) {
-        LOGI("【文本拦截】游戏正在渲染文字，字符串内存地址: %p", il2cpp_string);
+    if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
+        // 将 C# 的 UTF-16 字符串转换为 C++ 的 UTF-8 字符串
+        std::string text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
+        
+        // 核心打印：直接输出文本长度和文本内容！
+        LOGI("【文本拦截】长度: %d | 内容: %s", il2cpp_string->length, text.c_str());
+        
+        // 💡 提示预留：以后要汉化文本时，就是在这里加判断并修改 il2cpp_string
     }
     // 放行，让游戏照常显示文字
     old_set_text(__this, il2cpp_string);
