@@ -93,8 +93,11 @@ void hack_start(const char *game_data_dir) {
             // 先安装退出 Hook
             hook_exit_functions();
 
-            il2cpp_api_init(handle);
-            il2cpp_hook();
+            // ====== 核心修改：已关闭针对旧版 Unity 的全自动 API 扫描，防止 Unity 6 引擎闪退 ======
+            // il2cpp_api_init(handle);
+            // il2cpp_hook();
+            // ===============================================================================
+            
             break;
         } else {
             sleep(1);
