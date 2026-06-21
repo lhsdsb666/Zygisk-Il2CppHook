@@ -126,7 +126,7 @@ void hack_start(const char *game_data_dir) {
             // 2. 获取基地址并挂钩文本函数
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
             if (il2cpp_base != 0) {
-                LOGI("【成功】安全获取到 il2cpp 基地址: 0x%lx", il2cpp_base);
+                LOGI("【成功】安全获取到 il2cpp 基地址: 0x%llx", (unsigned long long)il2cpp_base);
                 
                 // 对应你的 RVA 基地址 0xb5b099c
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5b099c);
