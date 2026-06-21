@@ -16,87 +16,14 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
-#include <cstdint> // 新增：确保 uintptr_t 全局可用，防止编译报错
-#include <string>  // 新增：确保 std::string 和字符串操作可用
+#include <cstdint> 
+#include <string>  
+#include <unordered_map> // 新增：用于存放汉化对照字典
 
-// ===== 核心黑科技：直接前置声明 Dobby 函数，免去引入 dobby.h 的麻烦，防止 GitHub 报找不到头文件错误 =====
+// ===== 直接前置声明 Dobby 函数 =====
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
-// ==================== 新增：获取模块基地址的绝对安全函数 ====================
-uintptr_t get_module_base(const char* module_name) {
-    uintptr_t base = 0;
-    char line[512];
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (fp != nullptr) {
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, module_name) != nullptr) {
-                base = strtoul(line, nullptr, 16);
-                break;
-            }
-        }
-        fclose(fp);
-    }
-    return base;
-}
-
-// ==================== 新增：Hook 退出函数 ====================
-static void (*old_exit)(int status) = nullptr;
-static void (*old__exit)(int status) = nullptr;
-static void (*old_abort)() = nullptr;
-
-void my_exit(int status) {
-    LOGI("【Hook】Blocked exit(%d) ! 阻止游戏自杀", status);
-    // 强行让反作弊线程陷入无限休眠，卡死反作弊
-    while (true) {
-        sleep(3600);
-    }
-}
-
-void my__exit(int status) {
-    LOGI("【Hook】Blocked _exit(%d) ! 阻止游戏自杀", status);
-    while (true) {
-        sleep(3600);
-    }
-}
-
-void my_abort() {
-    LOGI("【Hook】Blocked abort() ! 阻止游戏自杀");
-    while (true) {
-        sleep(3600);
-    }
-}
-
-// 安装 Hook 函数
-void hook_exit_functions() {
-    void* libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
-    if (libc != nullptr) {
-        // Hook exit
-        void* exit_sym = dlsym(libc, "exit");
-        if (exit_sym) {
-            DobbyHook(exit_sym, (void*)my_exit, (void**)&old_exit);
-            LOGI("Hooked exit() at %p", exit_sym);
-        }
-
-        // Hook _exit
-        void* _exit_sym = dlsym(libc, "_exit");
-        if (_exit_sym) {
-            DobbyHook(_exit_sym, (void*)my__exit, (void**)&old__exit);
-            LOGI("Hooked _exit() at %p", _exit_sym);
-        }
-    }
-
-    // Hook abort
-    void* abort_sym = dlsym(RTLD_DEFAULT, "abort");
-    if (abort_sym) {
-        DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
-        LOGI("Hooked abort() at %p", abort_sym);
-    }
-
-    LOGI("【Hook】Exit functions hooked successfully");
-}
-
-// ==================== 核心新增：TextMeshPro 文本拦截器 ====================
-// 1. 定义 Unity 底层的 C# 字符串结构体
+// ==================== Unity 底层字符串结构与 API 定义 ====================
 struct MyIl2CppString {
     void* klass;
     void* monitor;
@@ -104,7 +31,21 @@ struct MyIl2CppString {
     char16_t chars[0]; 
 };
 
-// 2. UTF-16 转 UTF-8 转换函数（防止韩文/中文在 logcat 中乱码）
+// 定义 il2cpp_string_new 函数指针，用来动态创建 C# 字符串
+typedef MyIl2CppString* (*il2cpp_string_new_ptr)(const char* text);
+static il2cpp_string_new_ptr il2cpp_string_new = nullptr;
+
+// ==================== 新增：简易汉化字典 ====================
+// 💡 这里先拿你日志里刷出来的几个词做测试，后续可以无限追加
+static const std::unordered_map<std::string, std::string> translation_dict = {
+    {"상점", "商店（已汉化）"},
+    {"친구", "好友"},
+    {"이벤트 팝업", "活动弹窗"},
+    {"레벨 패스", "等级通行证"},
+    {"BETA", "测试版"}
+};
+
+// UTF-16 转 UTF-8 转换函数
 std::string utf16_to_utf8(const char16_t* utf16, int len) {
     std::string utf8;
     for (int i = 0; i < len; ++i) {
@@ -135,41 +76,107 @@ std::string utf16_to_utf8(const char16_t* utf16, int len) {
     return utf8;
 }
 
+// 获取模块基地址
+uintptr_t get_module_base(const char* module_name) {
+    uintptr_t base = 0;
+    char line[512];
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (fp != nullptr) {
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, module_name) != nullptr) {
+                base = strtoul(line, nullptr, 16);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    return base;
+}
+
+// ==================== Hook 退出函数（防反作弊自杀） ====================
+static void (*old_exit)(int status) = nullptr;
+static void (*old__exit)(int status) = nullptr;
+static void (*old_abort)() = nullptr;
+
+void my_exit(int status) {
+    LOGI("【Hook】Blocked exit(%d) ! 阻止游戏自杀", status);
+    while (true) { sleep(3600); }
+}
+void my__exit(int status) {
+    LOGI("【Hook】Blocked _exit(%d) ! 阻止游戏自杀", status);
+    while (true) { sleep(3600); }
+}
+void my_abort() {
+    LOGI("【Hook】Blocked abort() ! 阻止游戏自杀");
+    while (true) { sleep(3600); }
+}
+
+void hook_exit_functions() {
+    void* libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (libc != nullptr) {
+        void* exit_sym = dlsym(libc, "exit");
+        if (exit_sym) DobbyHook(exit_sym, (void*)my_exit, (void**)&old_exit);
+        void* _exit_sym = dlsym(libc, "_exit");
+        if (_exit_sym) DobbyHook(_exit_sym, (void*)my__exit, (void**)&old__exit);
+    }
+    void* abort_sym = dlsym(RTLD_DEFAULT, "abort");
+    if (abort_sym) DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
+}
+
+// ==================== TextMeshPro 文本拦截与替换器 ====================
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
-    // 只要游戏调用这个函数，就会在这里被我们抓个正着
+    // 创建一个指针变量，默认指向游戏原本的字符串
+    MyIl2CppString* final_string = il2cpp_string;
+
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
-        // 将 C# 的 UTF-16 字符串转换为 C++ 的 UTF-8 字符串
-        std::string text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
+        // 1. 解析当前文本
+        std::string origin_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         
-        // 核心打印：直接输出文本长度和文本内容！
-        LOGI("【文本拦截】长度: %d | 内容: %s", il2cpp_string->length, text.c_str());
-        
-        // 💡 提示预留：以后要汉化文本时，就是在这里加判断并修改 il2cpp_string
+        // 2. 查字典看看有没有汉化文本
+        auto it = translation_dict.find(origin_text);
+        if (it != translation_dict.end()) {
+            std::string translated_text = it->second;
+            
+            // 3. 核心：如果找到了翻译，并且 il2cpp_string_new 成功加载，就动态生成新的 C# 字符串
+            if (il2cpp_string_new != nullptr) {
+                final_string = il2cpp_string_new(translated_text.c_str());
+                LOGI("【成功汉化】%s -> %s", origin_text.c_str(), translated_text.c_str());
+            }
+        } else {
+            // 没在字典里的词，依然打印出来方便你收集漏网之鱼
+            LOGI("【未翻译文本】内容: %s", origin_text.c_str());
+        }
     }
-    // 放行，让游戏照常显示文字
-    old_set_text(__this, il2cpp_string);
+    
+    // 放行！如果是字典里的词，此时丢给游戏的已经是中文的新指针了
+    old_set_text(__this, final_string);
 }
-// ========================================================
 
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
-    
     LOGI("hack_start started, waiting for libil2cpp.so...");
 
-    // 300次循环等待
     for (int i = 0; i < 300; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
             LOGI("Found libil2cpp.so! Starting hooks...");
 
-            // 1. 先安装退出 Hook
+            // 1. 安装退出 Hook
             hook_exit_functions();
 
-            // 2. 获取基地址并挂钩文本函数
+            // 2. 动态定位并获取 Unity 官方的字符串创建函数
+            il2cpp_string_new = (il2cpp_string_new_ptr)xdl_sym(handle, "il2cpp_string_new", nullptr);
+            if (il2cpp_string_new != nullptr) {
+                LOGI("【成功】获取到 il2cpp_string_new 导出函数！");
+            } else {
+                LOGE("【失败】未找到 il2cpp_string_new 导出函数！");
+            }
+
+            // 3. 获取基地址并挂钩文本函数
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
             if (il2cpp_base != 0) {
                 LOGI("【成功】安全获取到 il2cpp 基地址: 0x%llx", (unsigned long long)il2cpp_base);
@@ -177,68 +184,43 @@ void hack_start(const char *game_data_dir) {
                 // 对应你的 RVA 基地址 0xb5b099c
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5b099c);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
-                LOGI("【成功】TextMeshPro::set_text 挂钩完成！地址: %p", set_text_addr);
+                LOGI("【成功】TextMeshPro::set_text 挂钩完成！");
             } else {
                 LOGE("【失败】未能获取到 il2cpp 基地址");
             }
-
-            // il2cpp_api_init(handle);
-            // il2cpp_hook();
             break;
         } else {
             sleep(1);
         }
     }
-    
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
-    }
 }
 
+// ==================== 后续原封不动的底层适配代码 ====================
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
     if (activity_thread_clz != nullptr) {
-        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
-                                                                "currentApplication",
-                                                                "()Landroid/app/Application;");
+        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
         if (currentApplicationId) {
-            jobject application = env->CallStaticObjectMethod(activity_thread_clz,
-                                                              currentApplicationId);
+            jobject application = env->CallStaticObjectMethod(activity_thread_clz, currentApplicationId);
             jclass application_clazz = env->GetObjectClass(application);
             if (application_clazz) {
-                jmethodID get_application_info = env->GetMethodID(application_clazz,
-                                                                  "getApplicationInfo",
-                                                                  "()Landroid/content/pm/ApplicationInfo;");
+                jmethodID get_application_info = env->GetMethodID(application_clazz, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
                 if (get_application_info) {
-                    jobject application_info = env->CallObjectMethod(application,
-                                                                     get_application_info);
-                    jfieldID native_library_dir_id = env->GetFieldID(
-                            env->GetObjectClass(application_info), "nativeLibraryDir",
-                            "Ljava/lang/String;");
+                    jobject application_info = env->CallObjectMethod(application, get_application_info);
+                    jfieldID native_library_dir_id = env->GetFieldID(env->GetObjectClass(application_info), "nativeLibraryDir", "Ljava/lang/String;");
                     if (native_library_dir_id) {
-                        auto native_library_dir_jstring = (jstring) env->GetObjectField(
-                                application_info, native_library_dir_id);
+                        auto native_library_dir_jstring = (jstring) env->GetObjectField(application_info, native_library_dir_id);
                         auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
                         LOGI("lib dir %s", path);
                         std::string lib_dir(path);
                         env->ReleaseStringUTFChars(native_library_dir_jstring, path);
                         return lib_dir;
-                    } else {
-                        LOGE("nativeLibraryDir not found");
                     }
-                } else {
-                    LOGE("getApplicationInfo not found");
                 }
-            } else {
-                LOGE("application class not found");
             }
-        } else {
-            LOGE("currentApplication not found");
         }
-    } else {
-        LOGE("ActivityThread not found");
     }
     return {};
 }
@@ -250,94 +232,36 @@ static std::string GetNativeBridgeLibrary() {
 }
 
 struct NativeBridgeCallbacks {
-    uint32_t version;
-    void *initialize;
-
+    uint32_t version; void *initialize;
     void *(*loadLibrary)(const char *libpath, int flag);
-
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
-
-    void *isSupported;
-    void *getAppEnv;
-    void *isCompatibleWith;
-    void *getSignalHandler;
-    void *unloadLibrary;
-    void *getError;
-    void *isPathSupported;
-    void *initAnonymousNamespace;
-    void *createNamespace;
-    void *linkNamespaces;
-
+    void *isSupported; void *getAppEnv; void *isCompatibleWith; void *getSignalHandler;
+    void *unloadLibrary; void *getError; void *isPathSupported; void *initAnonymousNamespace;
+    void *createNamespace; void *linkNamespaces;
     void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
     sleep(5);
-
     auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
-                                                                             "JNI_GetCreatedJavaVMs");
-    LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
-    JavaVM *vms_buf[1];
-    JavaVM *vms;
-    jsize num_vms;
+    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
+    JavaVM *vms_buf[1]; JavaVM *vms; jsize num_vms;
     jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
-    if (status == JNI_OK && num_vms > 0) {
-        vms = vms_buf[0];
-    } else {
-        LOGE("GetCreatedJavaVMs error");
-        return false;
-    }
-
+    if (status == JNI_OK && num_vms > 0) { vms = vms_buf[0]; } else { return false; }
     auto lib_dir = GetLibDir(vms);
-    if (lib_dir.empty()) {
-        LOGE("GetLibDir error");
-        return false;
-    }
-    if (lib_dir.find("/lib/x86") != std::string::npos) {
-        LOGI("no need NativeBridge");
-        munmap(data, length);
-        return false;
-    }
-
+    if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) { munmap(data, length); return false; }
     auto nb = dlopen("libhoudini.so", RTLD_NOW);
-    if (!nb) {
-        auto native_bridge = GetNativeBridgeLibrary();
-        LOGI("native bridge: %s", native_bridge.data());
-        nb = dlopen(native_bridge.data(), RTLD_NOW);
-    }
+    if (!nb) { auto native_bridge = GetNativeBridgeLibrary(); nb = dlopen(native_bridge.data(), RTLD_NOW); }
     if (nb) {
-        LOGI("nb %p", nb);
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
-            LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
-            LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
-            LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
-
-            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
-            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
-            memcpy(mem, data, length);
-            munmap(mem, length);
-            munmap(data, length);
-            char path[PATH_MAX];
-            snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-            LOGI("arm path %s", path);
-
-            void *arm_handle;
-            if (api_level >= 26) {
-                arm_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
-            } else {
-                arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
-            }
+            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC); ftruncate(fd, (off_t) length);
+            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0); memcpy(mem, data, length); munmap(mem, length); munmap(data, length);
+            char path[PATH_MAX]; snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
+            void *arm_handle = (api_level >= 26) ? callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3) : callbacks->loadLibrary(path, RTLD_NOW);
             if (arm_handle) {
-                LOGI("arm handle %p", arm_handle);
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
-                                                                                  "JNI_OnLoad",
-                                                                                  nullptr, 0);
-                LOGI("JNI_OnLoad %p", init);
-                init(vms, (void *) game_data_dir);
-                return true;
+                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle, "JNI_OnLoad", nullptr, 0);
+                init(vms, (void *) game_data_dir); return true;
             }
             close(fd);
         }
@@ -346,10 +270,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
 }
 
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("hack thread: %d", gettid());
     int api_level = android_get_device_api_level();
-    LOGI("api level: %d", api_level);
-
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
 #endif
@@ -360,12 +281,10 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 }
 
 #if defined(__arm__) || defined(__aarch64__)
-
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *) reserved;
     std::thread hack_thread(hack_start, game_data_dir);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
-
 #endif
