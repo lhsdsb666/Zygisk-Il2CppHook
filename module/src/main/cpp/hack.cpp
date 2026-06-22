@@ -18,7 +18,7 @@
 #include <array>
 #include <cstdint> 
 #include <string>  
-#include <unordered_map> // 新增：用于存放汉化对照字典
+#include <unordered_map> 
 
 // ===== 直接前置声明 Dobby 函数 =====
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
@@ -35,13 +35,15 @@ struct MyIl2CppString {
 typedef MyIl2CppString* (*il2cpp_string_new_ptr)(const char* text);
 static il2cpp_string_new_ptr il2cpp_string_new = nullptr;
 
-// ==================== 新增：简易汉化字典 ====================
-// 💡 这里先拿你日志里刷出来的几个词做测试，后续可以无限追加
+// 用于存储从国服动态加载的字体资产指针（保留后续代码层直接注入的能力）
+static void* china_font_asset_ptr = nullptr;
+
+// ==================== 简易汉化字典 ====================
 static const std::unordered_map<std::string, std::string> translation_dict = {
-    {"상점", "商店（已汉化）"},
+    {"상점", "商店"},
     {"친구", "好友"},
     {"이벤트 팝업", "活动弹窗"},
-    {"레벨 패스", "等级通行证"},
+    {"레벨 패斯", "等级通行证"},
     {"BETA", "测试版"}
 };
 
@@ -127,7 +129,6 @@ void hook_exit_functions() {
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
-    // 创建一个指针变量，默认指向游戏原本的字符串
     MyIl2CppString* final_string = il2cpp_string;
 
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
@@ -139,21 +140,24 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
         if (it != translation_dict.end()) {
             std::string translated_text = it->second;
             
-            // 3. 核心：如果找到了翻译，并且 il2cpp_string_new 成功加载，就动态生成新的 C# 字符串
+            // 3. 如果找到了翻译，并且 il2cpp_string_new 成功加载，就动态生成新的 C# 字符串
             if (il2cpp_string_new != nullptr) {
                 final_string = il2cpp_string_new(translated_text.c_str());
                 LOGI("【成功汉化】%s -> %s", origin_text.c_str(), translated_text.c_str());
+                
+                // 💡 提示：如果配合 UABEA 修改依赖成功，这里不需要额外逻辑，游戏会通过 Fallback 机制自动寻找中文字体。
+                // 如果后续需要使用纯代码流强制将特定的文本渲染器（__this）的字体更换为国服字体，
+                // 可以在此处调用 TextMeshPro 的 set_font 函数指针。
             }
         } else {
-            // 没在字典里的词，依然打印出来方便你收集漏网之鱼
+            // 没在字典里的词，打印出来方便收集
             LOGI("【未翻译文本】内容: %s", origin_text.c_str());
         }
     }
     
-    // 放行！如果是字典里的词，此时丢给游戏的已经是中文的新指针了
+    // 放行给原函数
     old_set_text(__this, final_string);
 }
-
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
