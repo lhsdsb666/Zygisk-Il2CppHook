@@ -64,8 +64,8 @@ static AssetBundle_LoadAllAssets_t Unity_LoadAllAssets = nullptr;
 // ==================== 简易汉化字典 ====================
 static const std::unordered_map<std::string, std::string> translation_dict = {
     {"상점", "商店"},
-    {"친구", "好友"},
-    {"이벤트 팝업", "活动弹窗"},
+    {"친구", "zdjd"},
+    {"이벤트 팝업", "kskbl"},
     {"레벨 패스", "等级通行证"},
     {"BETA", "测试版"}
 };
