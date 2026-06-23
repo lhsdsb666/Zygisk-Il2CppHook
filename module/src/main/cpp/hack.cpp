@@ -38,12 +38,30 @@ static il2cpp_string_new_ptr il2cpp_string_new = nullptr;
 // 用于存储从国服动态加载的字体资产指针（保留后续代码层直接注入的能力）
 static void* china_font_asset_ptr = nullptr;
 
+// ===== 新增：IL2CPP 运行时反射与 iCall 函数指针定义 =====
+typedef void* (*il2cpp_resolve_icall_fn)(const char* name);
+typedef void* (*il2cpp_object_get_class_fn)(void* obj);
+typedef void* (*il2cpp_class_get_field_from_name_fn)(void* klass, const char* name);
+typedef void (*il2cpp_field_set_value_fn)(void* obj, void* field, void* value);
+
+static il2cpp_resolve_icall_fn il2cpp_resolve_icall = nullptr;
+static il2cpp_object_get_class_fn il2cpp_object_get_class = nullptr;
+static il2cpp_class_get_field_from_name_fn il2cpp_class_get_field_from_name = nullptr;
+static il2cpp_field_set_value_fn il2cpp_field_set_value = nullptr;
+
+typedef void* (*AssetBundle_LoadFromFile_t)(MyIl2CppString* path, uint32_t crc, uint64_t offset);
+typedef void* (*AssetBundle_LoadAllAssets_t)(void* bundle, void* type);
+
+static AssetBundle_LoadFromFile_t Unity_LoadFromFile = nullptr;
+static AssetBundle_LoadAllAssets_t Unity_LoadAllAssets = nullptr;
+// =======================================================
+
 // ==================== 简易汉化字典 ====================
 static const std::unordered_map<std::string, std::string> translation_dict = {
     {"상점", "商店"},
     {"친구", "好友"},
     {"이벤트 팝업", "活动弹窗"},
-    {"레벨 패斯", "等级通行证"},
+    {"레벨 패스", "等级通行证"},
     {"BETA", "测试版"}
 };
 
@@ -125,6 +143,39 @@ void hook_exit_functions() {
     if (abort_sym) DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
 }
 
+// ===== 新增：独立安全的外部字库唤醒模块 =====
+static bool g_font_loaded = false;
+void load_chinese_font_asset() {
+    if (g_font_loaded || !il2cpp_resolve_icall || !il2cpp_string_new) return;
+
+    // 吟唱字符串，通过 iCall 白名单机制无缝穿透获取 Unity 官方底层的加载函数
+    Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadFromFile_Internal(System.String,System.UInt32,System.UInt64)");
+    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.Type)");
+
+    if (Unity_LoadFromFile && Unity_LoadAllAssets) {
+        // 创建符合沙盒权限的 C# 路径字符串
+        MyIl2CppString* bundle_path = il2cpp_string_new("/data/data/com.vividstudio.trickcal/files/zh-hans");
+        void* font_bundle = Unity_LoadFromFile(bundle_path, 0, 0);
+
+        if (font_bundle) {
+            LOGI("【成功】国服 zh-hans 资产包物理唤醒成功！开始盲读内部资产...");
+            // 传入 nullptr，盲捞 AB 包内的全量资源
+            void* assets_array = Unity_LoadAllAssets(font_bundle, nullptr);
+            if (assets_array) {
+                // 在 64 位 Unity 环境下，C# 数组的 0x18 偏移（即指针数组第 4 项）通常是数据存放基准点
+                china_font_asset_ptr = ((void**)assets_array)[3];
+                LOGI("【核心突破】成功捕获中文字体内存指针，地址: %p", china_font_asset_ptr);
+            }
+        } else {
+            LOGE("【警报】未在指定路径 /data/data/com.vividstudio.trickcal/files/zh-hans 找到字库文件！");
+        }
+    } else {
+        LOGE("【致命错误】通过 iCall 绑定 Unity 底层文件加载 API 失败！");
+    }
+    g_font_loaded = true;
+}
+// =====================================================
+
 // ==================== TextMeshPro 文本拦截与替换器 ====================
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
@@ -148,6 +199,21 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
                 // 💡 提示：如果配合 UABEA 修改依赖成功，这里不需要额外逻辑，游戏会通过 Fallback 机制自动寻找中文字体。
                 // 如果后续需要使用纯代码流强制将特定的文本渲染器（__this）的字体更换为国服字体，
                 // 可以在此处调用 TextMeshPro 的 set_font 函数指针。
+
+                // ===== 新增：动态字段流——后台偷偷递上中文箱子 =====
+                if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class && il2cpp_class_get_field_from_name && il2cpp_field_set_value) {
+                    void* text_klass = il2cpp_object_get_class(__this);
+                    if (text_klass) {
+                        // 动态反射抓取当前 TMP 控件的主字体属性字段 m_fontAsset
+                        void* font_field = il2cpp_class_get_field_from_name(text_klass, "m_fontAsset");
+                        if (font_field) {
+                            // 强行把这个高亮文本框的主字体，掉包成国服中文字体指针
+                            il2cpp_field_set_value(__this, font_field, china_font_asset_ptr);
+                            LOGI("【内存掉包】成功将 TMP 控件 %p 的 m_fontAsset 变更为中文库！", __this);
+                        }
+                    }
+                }
+                // ===================================================
             }
         } else {
             // 没在字典里的词，打印出来方便收集
@@ -179,6 +245,18 @@ void hack_start(const char *game_data_dir) {
             } else {
                 LOGE("【失败】未找到 il2cpp_string_new 导出函数！");
             }
+
+            // ===== 新增：动态绑定 IL2CPP 核心基建 API =====
+            il2cpp_resolve_icall = (il2cpp_resolve_icall_fn)xdl_sym(handle, "il2cpp_resolve_icall", nullptr);
+            il2cpp_object_get_class = (il2cpp_object_get_class_fn)xdl_sym(handle, "il2cpp_object_get_class", nullptr);
+            il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_fn)xdl_sym(handle, "il2cpp_class_get_field_from_name", nullptr);
+            il2cpp_field_set_value = (il2cpp_field_set_value_fn)xdl_sym(handle, "il2cpp_field_set_value", nullptr);
+
+            // 基建 API 成功就位后，立刻在后台安全加载国服字库
+            if (il2cpp_resolve_icall != nullptr) {
+                load_chinese_font_asset();
+            }
+            // ============================================
 
             // 3. 获取基地址并挂钩文本函数
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
