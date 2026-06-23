@@ -154,7 +154,7 @@ void load_chinese_font_asset() {
 
     if (Unity_LoadFromFile && Unity_LoadAllAssets) {
         // 创建符合沙盒权限的 C# 路径字符串
-        MyIl2CppString* bundle_path = il2cpp_string_new("/data/data/com.vividstudio.trickcal/files/zh-hans");
+        MyIl2CppString* bundle_path = il2cpp_string_new("/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans");
         void* font_bundle = Unity_LoadFromFile(bundle_path, 0, 0);
 
         if (font_bundle) {
