@@ -1,4 +1,8 @@
-// ===== 带有全量内存雷达诊断的 hack.cpp =====
+//
+// Created by Perfare on 2020/7/4.
+// 完美解决 Split APK 虚拟路径问题的终极版 hack.cpp
+//
+
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
@@ -19,6 +23,7 @@
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
+// ==================== Unity 底层字符串结构与 API 定义 ====================
 struct MyIl2CppString {
     void* klass;
     void* monitor;
@@ -48,11 +53,12 @@ typedef void* (*AssetBundle_LoadAllAssets_t)(void* bundle, void* type);
 static AssetBundle_LoadFromFile_t Unity_LoadFromFile = nullptr;
 static AssetBundle_LoadAllAssets_t Unity_LoadAllAssets = nullptr;
 
+// ==================== 简易汉化字典 ====================
 static const std::unordered_map<std::string, std::string> translation_dict = {
     {"상점", "商店"},
     {"친구", "好友"},
     {"이벤트 팝업", "活动弹窗"},
-    {"레벨 패斯", "等级通行证"},
+    {"레벨 패스", "等级通行证"},
     {"BETA", "测试版"}
 };
 
@@ -86,23 +92,64 @@ std::string utf16_to_utf8(const char16_t* utf16, int len) {
     return utf8;
 }
 
-uintptr_t get_module_base(const char* module_name) {
-    uintptr_t base = 0;
+// ===== 核心新增：直接从内核内存盘中榨取带有"!"的完整分包物理路径 =====
+std::string get_module_path_and_base(const char* module_name, uintptr_t& out_base) {
+    out_base = 0;
     char line[512];
     FILE* fp = fopen("/proc/self/maps", "r");
     if (fp != nullptr) {
         while (fgets(line, sizeof(line), fp)) {
             if (strstr(line, module_name) != nullptr) {
-                base = strtoul(line, nullptr, 16);
-                break;
+                if (out_base == 0) {
+                    out_base = strtoul(line, nullptr, 16);
+                }
+                char* path_start = strchr(line, '/');
+                if (path_start) {
+                    std::string path(path_start);
+                    while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) {
+                        path.pop_back();
+                    }
+                    fclose(fp);
+                    return path;
+                }
             }
         }
         fclose(fp);
     }
-    return base;
+    return "";
 }
 
-// ==================== 唤醒与雷达扫描模块 ====================
+// ==================== Hook 退出函数（防反作弊自杀） ====================
+static void (*old_exit)(int status) = nullptr;
+static void (*old__exit)(int status) = nullptr;
+static void (*old_abort)() = nullptr;
+
+void my_exit(int status) {
+    LOGI("【Hook】Blocked exit(%d) ! 阻止游戏自杀", status);
+    while (true) { sleep(3600); }
+}
+void my__exit(int status) {
+    LOGI("【Hook】Blocked _exit(%d) ! 阻止游戏自杀", status);
+    while (true) { sleep(3600); }
+}
+void my_abort() {
+    LOGI("【Hook】Blocked abort() ! 阻止游戏自杀");
+    while (true) { sleep(3600); }
+}
+
+void hook_exit_functions() {
+    void* libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (libc != nullptr) {
+        void* exit_sym = dlsym(libc, "exit");
+        if (exit_sym) DobbyHook(exit_sym, (void*)my_exit, (void**)&old_exit);
+        void* _exit_sym = dlsym(libc, "_exit");
+        if (_exit_sym) DobbyHook(_exit_sym, (void*)my__exit, (void**)&old__exit);
+    }
+    void* abort_sym = dlsym(RTLD_DEFAULT, "abort");
+    if (abort_sym) DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
+}
+
+// ==================== 外部字库唤醒模块 ====================
 static bool g_font_loaded = false;
 void load_chinese_font_asset() {
     if (g_font_loaded || !il2cpp_resolve_icall || !il2cpp_string_new) return;
@@ -111,43 +158,36 @@ void load_chinese_font_asset() {
     Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.Type)");
 
     if (Unity_LoadFromFile && Unity_LoadAllAssets) {
-        const char* target_path = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
-        MyIl2CppString* bundle_path = il2cpp_string_new(target_path);
-        
-        LOGI("【雷达】正在尝试从路径加载 AB 包: %s", target_path);
+        MyIl2CppString* bundle_path = il2cpp_string_new("/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans");
         void* font_bundle = Unity_LoadFromFile(bundle_path, 0, 0);
 
         if (font_bundle) {
             LOGI("【雷达】物理加载成功！大箱子地址: %p。开始遍历内部资产...", font_bundle);
             void* assets_array = Unity_LoadAllAssets(font_bundle, nullptr);
-            
             if (assets_array) {
-                // 打印周边内存，暴力扫描究竟哪个位置才是真的 FontAsset
+                // 暴力遍历前10个元素，精准识别 FontAsset 骨骼
                 for (int i = 0; i < 10; i++) {
                     void* test_ptr = ((void**)assets_array)[i];
                     if (test_ptr && il2cpp_object_get_class && il2cpp_class_get_name) {
                         void* klass = il2cpp_object_get_class(test_ptr);
                         const char* class_name = il2cpp_class_get_name(klass);
-                        LOGI("【雷达扫描】数组下标 [%d] 处的资产类型为: %s, 指针: %p", i, class_name, test_ptr);
+                        LOGI("【雷达扫描】数组下标 [%d] 处的资产类型为: %s", i, class_name);
                         
-                        // 如果名字里面包含 FontAsset，说明抓到正主了！
                         if (strstr(class_name, "FontAsset") != nullptr || strstr(class_name, "TMP_Font") != nullptr) {
                             china_font_asset_ptr = test_ptr;
-                            LOGI("🎯【精准锁定】在下标 [%d] 成功截获中文字体指针！", i);
+                            LOGI("🎯【精准锁定】在下标 [%d] 成功截获中文字体指针: %p", i, china_font_asset_ptr);
                         }
                     }
                 }
-            } else {
-                LOGE("【雷达错误】LoadAllAssets 返回了空解压数组！包内可能无资产。");
             }
         } else {
-            LOGE("【雷达错误】Unity 引擎拒绝加载此包，请检查文件是否在 MT 里成功复制，或者文件是否损坏！");
+            LOGE("【雷达错误】未在外部沙盒找到字库包 zh-hans 或文件损坏！");
         }
     }
     g_font_loaded = true;
 }
 
-// ==================== TextMeshPro 文本挂钩拦截 ====================
+// ==================== TextMeshPro 文本拦截与替换器 ====================
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
@@ -156,19 +196,18 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string origin_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         auto it = translation_dict.find(origin_text);
-        
         if (it != translation_dict.end()) {
             std::string translated_text = it->second;
             if (il2cpp_string_new != nullptr) {
                 final_string = il2cpp_string_new(translated_text.c_str());
+                LOGI("【成功汉化】%s -> %s", origin_text.c_str(), translated_text.c_str());
                 
-                // 如果抓到了中文字体指针，尝试注入
+                // 动态将控件字体变更为中文字体
                 if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class && il2cpp_class_get_field_from_name && il2cpp_field_set_value) {
                     void* text_klass = il2cpp_object_get_class(__this);
                     if (text_klass) {
                         void* font_field = il2cpp_class_get_field_from_name(text_klass, "m_fontAsset");
                         if (font_field) {
-                            // 安全注入防护
                             il2cpp_field_set_value(__this, font_field, &china_font_asset_ptr);
                         }
                     }
@@ -179,36 +218,69 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     old_set_text(__this, final_string);
 }
 
+// ==================== 突破改造后的核心启动器 ====================
 void hack_start(const char *game_data_dir) {
-    LOGI("hack_start started...");
-    for (int i = 0; i < 300; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            il2cpp_string_new = (il2cpp_string_new_ptr)xdl_sym(handle, "il2cpp_string_new", nullptr);
-            il2cpp_resolve_icall = (il2cpp_resolve_icall_fn)xdl_sym(handle, "il2cpp_resolve_icall", nullptr);
-            il2cpp_object_get_class = (il2cpp_object_get_class_fn)xdl_sym(handle, "il2cpp_object_get_class", nullptr);
-            il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_fn)xdl_sym(handle, "il2cpp_class_get_field_from_name", nullptr);
-            il2cpp_field_set_value = (il2cpp_field_set_value_fn)xdl_sym(handle, "il2cpp_field_set_value", nullptr);
-            il2cpp_class_get_name = (il2cpp_class_get_name_fn)xdl_sym(handle, "il2cpp_class_get_name", nullptr);
+    LOGI("hack_start started, entering deployment loop...");
+    hook_exit_functions(); // 提前安装防自杀 Hook
 
-            if (il2cpp_resolve_icall != nullptr) {
-                load_chinese_font_asset();
+    uintptr_t il2cpp_base = 0;
+    for (int i = 0; i < 300; i++) {
+        // 核心修复：直接从内核抓取最真实的物理分包路径
+        std::string real_path = get_module_path_and_base("libil2cpp.so", il2cpp_base);
+        
+        if (!real_path.empty() && il2cpp_base != 0) {
+            LOGI("【核心发现】成功从内存抓取到 il2cpp 真实绝对路径: %s", real_path.c_str());
+            LOGI("【核心发现】安全捕获基地址: 0x%llx", (unsigned long long)il2cpp_base);
+            
+            // 三路闭环句柄加载机制
+            void *handle = xdl_open(real_path.c_str(), 0); // 1. 尝试绝对路径
+            if (!handle) {
+                handle = xdl_open("libil2cpp.so", 0);      // 2. 尝试标准盲搜
+            }
+            if (!handle) {
+                handle = dlopen(real_path.c_str(), RTLD_LAZY); // 3. 尝试原生 dlopen
             }
 
-            uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
-            if (il2cpp_base != 0) {
+            if (handle) {
+                LOGI("【成功】libil2cpp.so 核心句柄接驳成功！开始绑定运行时接口...");
+                
+                // 智能符号查找器
+                auto find_sym = [](void* h, const char* name) -> void* {
+                    void* sym = xdl_sym(h, name, nullptr);
+                    if (!sym) sym = dlsym(h, name);
+                    return sym;
+                };
+
+                il2cpp_string_new = (il2cpp_string_new_ptr)find_sym(handle, "il2cpp_string_new");
+                il2cpp_resolve_icall = (il2cpp_resolve_icall_fn)find_sym(handle, "il2cpp_resolve_icall");
+                il2cpp_object_get_class = (il2cpp_object_get_class_fn)find_sym(handle, "il2cpp_object_get_class");
+                il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_fn)find_sym(handle, "il2cpp_class_get_field_from_name");
+                il2cpp_field_set_value = (il2cpp_field_set_value_fn)find_sym(handle, "il2cpp_field_set_value");
+                il2cpp_class_get_name = (il2cpp_class_get_name_fn)find_sym(handle, "il2cpp_class_get_name");
+
+                // 基建就位，立刻唤醒国服中文字库
+                if (il2cpp_resolve_icall != nullptr) {
+                    load_chinese_font_asset();
+                }
+
+                // 进行 TextMeshPro 函数 Hook 挂载
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5b099c);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
-                LOGI("【成功】TextMeshPro::set_text 诊断挂钩完成！");
+                LOGI("【成功】TextMeshPro::set_text 核心 Hook 部署完毕！");
+                break;
+            } else {
+                LOGE("【警报】已抓到路径，但所有句柄加载器均告失败，第 %d 次重试...", i);
             }
-            break;
         } else {
-            sleep(1);
+            if (i % 5 == 0) {
+                LOGI("【等待】libil2cpp.so 尚未被 Unity 加载进内存，持续监控中... (%d/300)", i);
+            }
         }
+        sleep(1);
     }
 }
 
-// ==================== 原封不动的底层兼容与 JNI 桥接 ====================
+// ==================== 原封不动的底层适配与桥接代码 ====================
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
