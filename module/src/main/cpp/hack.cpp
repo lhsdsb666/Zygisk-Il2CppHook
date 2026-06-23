@@ -153,7 +153,7 @@ void load_chinese_font_asset() {
     Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.Type)");
 
     if (Unity_LoadFromFile && Unity_LoadAllAssets) {
-        // 创建符合沙盒权限的 C# 路径字符串
+        // 【已修正】完美匹配长官 MT 管理器截图中的韩服外置沙盒绝对路径
         MyIl2CppString* bundle_path = il2cpp_string_new("/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans");
         void* font_bundle = Unity_LoadFromFile(bundle_path, 0, 0);
 
@@ -162,12 +162,13 @@ void load_chinese_font_asset() {
             // 传入 nullptr，盲捞 AB 包内的全量资源
             void* assets_array = Unity_LoadAllAssets(font_bundle, nullptr);
             if (assets_array) {
-                // 在 64 位 Unity 环境下，C# 数组的 0x18 偏移（即指针数组第 4 项）通常是数据存放基准点
-                china_font_asset_ptr = ((void**)assets_array)[3];
+                // 【已修正】64位 Unity 环境下，C# 数组的第一个有效元素资产（Element 0）存放在指针数组的第 4 项（下标为 4）
+                china_font_asset_ptr = ((void**)assets_array)[4];
                 LOGI("【核心突破】成功捕获中文字体内存指针，地址: %p", china_font_asset_ptr);
             }
         } else {
-            LOGE("【警报】未在指定路径 /data/data/com.vividstudio.trickcal/files/zh-hans 找到字库文件！");
+            // 【已修正】同步更新警报日志路径，方便看 Log 诊断
+            LOGE("【警报】未在指定路径 /storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans 找到字库文件！");
         }
     } else {
         LOGE("【致命错误】通过 iCall 绑定 Unity 底层文件加载 API 失败！");
@@ -196,10 +197,6 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
                 final_string = il2cpp_string_new(translated_text.c_str());
                 LOGI("【成功汉化】%s -> %s", origin_text.c_str(), translated_text.c_str());
                 
-                // 💡 提示：如果配合 UABEA 修改依赖成功，这里不需要额外逻辑，游戏会通过 Fallback 机制自动寻找中文字体。
-                // 如果后续需要使用纯代码流强制将特定的文本渲染器（__this）的字体更换为国服字体，
-                // 可以在此处调用 TextMeshPro 的 set_font 函数指针。
-
                 // ===== 新增：动态字段流——后台偷偷递上中文箱子 =====
                 if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class && il2cpp_class_get_field_from_name && il2cpp_field_set_value) {
                     void* text_klass = il2cpp_object_get_class(__this);
@@ -207,8 +204,8 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
                         // 动态反射抓取当前 TMP 控件的主字体属性字段 m_fontAsset
                         void* font_field = il2cpp_class_get_field_from_name(text_klass, "m_fontAsset");
                         if (font_field) {
-                            // 强行把这个高亮文本框的主字体，掉包成国服中文字体指针
-                            il2cpp_field_set_value(__this, font_field, china_font_asset_ptr);
+                            // 【已修正】强行把主字体掉包成国服中文字体指针（il2cpp_field_set_value 对引用类型必须传指针的地址 `&`）
+                            il2cpp_field_set_value(__this, font_field, &china_font_asset_ptr);
                             LOGI("【内存掉包】成功将 TMP 控件 %p 的 m_fontAsset 变更为中文库！", __this);
                         }
                     }
