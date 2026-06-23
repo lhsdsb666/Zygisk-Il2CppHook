@@ -1,6 +1,6 @@
 //
 // Created by Perfare on 2020/7/4.
-// 完美解决 Split APK 虚拟路径问题的终极版 hack.cpp (真·Font Fallback 级联进化版)
+// 完美解决 Split APK 虚拟路径问题的终极版 hack.cpp (真·层级检索与双保险进化版)
 //
 
 #include "hack.h"
@@ -39,19 +39,21 @@ typedef void* (*il2cpp_resolve_icall_fn)(const char* name);
 typedef void* (*il2cpp_object_get_class_fn)(void* obj);
 typedef void* (*il2cpp_class_get_field_from_name_fn)(void* klass, const char* name);
 typedef void (*il2cpp_field_set_value_fn)(void* obj, void* field, void* value);
-typedef void (*il2cpp_field_get_value_fn)(void* obj, void* field, void* value); // 【新增】读取字段值接口
-typedef void* (*il2cpp_class_get_method_from_name_fn)(void* klass, const char* name, int argsCount); // 【新增】查找方法接口
-typedef void* (*il2cpp_runtime_invoke_fn)(void* method, void* obj, void** args, void** exc); // 【新增】调用方法接口
+typedef void (*il2cpp_field_get_value_fn)(void* obj, void* field, void* value); 
+typedef void* (*il2cpp_class_get_method_from_name_fn)(void* klass, const char* name, int argsCount); 
+typedef void* (*il2cpp_runtime_invoke_fn)(void* method, void* obj, void** args, void** exc); 
 typedef const char* (*il2cpp_class_get_name_fn)(void* klass);
+typedef void* (*il2cpp_class_get_parent_fn)(void* klass); // 【核心新增】向上追溯基类的雷达接口
 
 static il2cpp_resolve_icall_fn il2cpp_resolve_icall = nullptr;
 static il2cpp_object_get_class_fn il2cpp_object_get_class = nullptr;
 static il2cpp_class_get_field_from_name_fn il2cpp_class_get_field_from_name = nullptr;
 static il2cpp_field_set_value_fn il2cpp_field_set_value = nullptr;
-static il2cpp_field_get_value_fn il2cpp_field_get_value = nullptr; // 【新增】
-static il2cpp_class_get_method_from_name_fn il2cpp_class_get_method_from_name = nullptr; // 【新增】
-static il2cpp_runtime_invoke_fn il2cpp_runtime_invoke = nullptr; // 【新增】
+static il2cpp_field_get_value_fn il2cpp_field_get_value = nullptr; 
+static il2cpp_class_get_method_from_name_fn il2cpp_class_get_method_from_name = nullptr; 
+static il2cpp_runtime_invoke_fn il2cpp_runtime_invoke = nullptr; 
 static il2cpp_class_get_name_fn il2cpp_class_get_name = nullptr;
+static il2cpp_class_get_parent_fn il2cpp_class_get_parent = nullptr; // 【核心新增】
 
 typedef void* (*AssetBundle_LoadFromFile_t)(MyIl2CppString* path, uint32_t crc, uint64_t offset);
 typedef void* (*AssetBundle_LoadAllAssets_t)(void* bundle, void* type);
@@ -98,7 +100,7 @@ std::string utf16_to_utf8(const char16_t* utf16, int len) {
     return utf8;
 }
 
-// ===== 核心新增：直接从内核内存盘中榨取带有"!"的完整分包物理路径 =====
+// ===== 直接从内核内存盘中榨取带有"!"的完整分包物理路径 =====
 std::string get_module_path_and_base(const char* module_name, uintptr_t& out_base) {
     out_base = 0;
     char line[512];
@@ -131,15 +133,15 @@ static void (*old__exit)(int status) = nullptr;
 static void (*old_abort)() = nullptr;
 
 void my_exit(int status) {
-    LOGI("【Hook】Blocked exit(%d) ! 阻止游戏自杀", status);
+    LOGI("[HACK_BYPASS] Blocked exit(%d)", status);
     while (true) { sleep(3600); }
 }
 void my__exit(int status) {
-    LOGI("【Hook】Blocked _exit(%d) ! 阻止游戏自杀", status);
+    LOGI("[HACK_BYPASS] Blocked _exit(%d)", status);
     while (true) { sleep(3600); }
 }
 void my_abort() {
-    LOGI("【Hook】Blocked abort() ! 阻止游戏自杀");
+    LOGI("[HACK_BYPASS] Blocked abort()");
     while (true) { sleep(3600); }
 }
 
@@ -155,45 +157,74 @@ void hook_exit_functions() {
     if (abort_sym) DobbyHook(abort_sym, (void*)my_abort, (void**)&old_abort);
 }
 
+// ==================== 【关键新增】祖孙三代层级字段搜索器 ====================
+void* find_field_in_hierarchy(void* klass, const char* field_name) {
+    void* field = nullptr;
+    while (klass != nullptr) {
+        if (il2cpp_class_get_field_from_name) {
+            field = il2cpp_class_get_field_from_name(klass, field_name);
+            if (field != nullptr) return field; // 在当前层找到了，直接返回
+        }
+        if (il2cpp_class_get_parent) {
+            klass = il2cpp_class_get_parent(klass); // 没找到，向父辈（基类）挺进
+        } else {
+            break;
+        }
+    }
+    return nullptr;
+}
+
 // ==================== 外部字库唤醒模块 ====================
 static bool g_font_loaded = false;
 void load_chinese_font_asset() {
     if (g_font_loaded || !il2cpp_resolve_icall || !il2cpp_string_new) return;
 
     Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadFromFile_Internal(System.String,System.UInt32,System.UInt64)");
-    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.Type)");
+    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.String,System.Type)"); 
+    if (!Unity_LoadAllAssets) {
+        Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.Type)");
+    }
 
     if (Unity_LoadFromFile && Unity_LoadAllAssets) {
-        MyIl2CppString* bundle_path = il2cpp_string_new("/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans");
-        void* font_bundle = Unity_LoadFromFile(bundle_path, 0, 0);
+        // 双通道路径：针对 Android 早期挂载未就位问题进行双向保底
+        const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
+        const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans";
+
+        void* font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_external), 0, 0);
+        if (!font_bundle) {
+            font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_internal), 0, 0);
+        }
 
         if (font_bundle) {
-            LOGI("【雷达】物理加载成功！大箱子地址: %p。开始遍历内部资产...", font_bundle);
+            LOGI("[HACK_FONT] AssetBundle loaded successfully at ptr: %p", font_bundle);
             void* assets_array = Unity_LoadAllAssets(font_bundle, nullptr);
             if (assets_array) {
-                // 【核心修复】安全获取 64位 IL2CPP 数组的真实长度（第 0x18 字节处）
+                // 读取长度进行安全限制，防止越界
                 int32_t array_length = *(int32_t*)((uintptr_t)assets_array + 0x18);
-                // 【核心修复】定位数据元素真正开始的指针偏移（第 0x20 字节处），彻底告别 [3] 地雷
-                void** items = (void**)((uintptr_t)assets_array + 0x20);
+                if (array_length <= 0 || array_length > 100) array_length = 10; 
 
-                LOGI("【雷达扫描】侦测到字库包内共有 %d 个资产，开始进行类型校对对齐...", array_length);
+                LOGI("[HACK_FONT] Array count parsed: %d. Scanning fields...", array_length);
+                // 核心重构：绝对偏移遍历。((void**)assets_array)[4] 完美跳过 32字节文件头，永不踩 [3] 号长度地雷！
                 for (int i = 0; i < array_length; i++) {
-                    void* test_ptr = items[i];
+                    void* test_ptr = ((void**)assets_array)[4 + i];
                     if (test_ptr && il2cpp_object_get_class && il2cpp_class_get_name) {
-                        void* klass = il2cpp_object_get_class(test_ptr);
-                        const char* class_name = il2cpp_class_get_name(klass);
-                        LOGI("【雷达扫描】资产下标 [%d] 处的类名: %s", i, class_name);
+                        if ((uintptr_t)test_ptr < 0x100000) continue; // 过滤非指针杂质
                         
-                        if (strstr(class_name, "FontAsset") != nullptr || strstr(class_name, "TMP_Font") != nullptr) {
+                        void* klass = il2cpp_object_get_class(test_ptr);
+                        if (!klass) continue;
+                        const char* class_name = il2cpp_class_get_name(klass);
+                        LOGI("[HACK_FONT] Index [%d] asset type: %s", i, class_name);
+                        
+                        if (class_name && (strstr(class_name, "FontAsset") != nullptr || strstr(class_name, "TMP_Font") != nullptr)) {
                             china_font_asset_ptr = test_ptr;
-                            LOGI("🎯【精准锁定】在安全下标 [%d] 拦截并捕获中文字体资产指针: %p", i, china_font_asset_ptr);
+                            LOGI("[HACK_FONT] Target font intercepted successfully! Ptr: %p", china_font_asset_ptr);
                             break; 
                         }
                     }
                 }
             }
         } else {
-            LOGE("【雷达错误】未在外部沙盒找到字库包 zh-hans 或文件损坏！");
+            LOGE("[HACK_FONT] ERROR: Cannot open font file zh-hans from both external and internal storage!");
         }
     }
     g_font_loaded = true;
@@ -201,12 +232,13 @@ void load_chinese_font_asset() {
 
 // ==================== TextMeshPro 文本拦截与替换器 ====================
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
-static bool s_fallback_injected = false; // 全局锁，确保后备字库链只挂载一次
+static bool s_fallback_injected = false; 
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     MyIl2CppString* final_string = il2cpp_string;
+    bool is_translated = false;
 
-    // 环节一：文本字典翻译
+    // 环节一：精准匹配汉化字典
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string origin_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         auto it = translation_dict.find(origin_text);
@@ -214,45 +246,48 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
             std::string translated_text = it->second;
             if (il2cpp_string_new != nullptr) {
                 final_string = il2cpp_string_new(translated_text.c_str());
-                LOGI("【成功汉化】%s -> %s", origin_text.c_str(), translated_text.c_str());
+                is_translated = true;
+                LOGI("[HACK_TXT] Translated successfully: %s -> %s", origin_text.c_str(), translated_text.c_str());
             }
         }
     }
 
-    // 环节二：【重大重构】真·后备字库挂载逻辑（Font Fallback 级联技术）
-    if (!s_fallback_injected && china_font_asset_ptr != nullptr && __this != nullptr && 
-        il2cpp_object_get_class && il2cpp_class_get_field_from_name && 
-        il2cpp_field_get_value && il2cpp_class_get_method_from_name && il2cpp_runtime_invoke) {
-        
+    // 环节二：双保险字库注入机制
+    if (is_translated && china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class) {
         void* text_klass = il2cpp_object_get_class(__this);
         if (text_klass) {
-            // 1. 抓取文本控件身上的主字体字段实例
-            void* font_field = il2cpp_class_get_field_from_name(text_klass, "m_fontAsset");
+            // 通过【层级检索器】越级提取隐藏在基类之中的 "m_fontAsset"
+            void* font_field = find_field_in_hierarchy(text_klass, "m_fontAsset");
+            
             if (font_field) {
-                void* korean_main_font = nullptr;
-                il2cpp_field_get_value(__this, font_field, &korean_main_font);
-                
-                if (korean_main_font) {
-                    void* font_klass = il2cpp_object_get_class(korean_main_font);
-                    if (font_klass) {
-                        // 2. 注入你在 dump.cs 里精准挖到的 Unity 6 关键后备列表字段："m_FallbackFontAssetTable"
-                        void* fallback_field = il2cpp_class_get_field_from_name(font_klass, "m_FallbackFontAssetTable");
-                        if (fallback_field) {
-                            void* fallback_list_obj = nullptr;
-                            il2cpp_field_get_value(korean_main_font, fallback_field, &fallback_list_obj);
-                            
-                            if (fallback_list_obj) {
-                                void* list_klass = il2cpp_object_get_class(fallback_list_obj);
-                                if (list_klass) {
-                                    // 3. 反射获取系统 List.Add(T item) 的原生底层方法
-                                    void* add_method = il2cpp_class_get_method_from_name(list_klass, "Add", 1);
-                                    if (add_method) {
-                                        // 4. 将提取出的国服 4K 中文字体指针追加到韩服原版列表末尾
-                                        void* args[1] = { china_font_asset_ptr };
-                                        il2cpp_runtime_invoke(add_method, fallback_list_obj, args, nullptr);
-                                        
-                                        LOGI("🎯【Fallback 成功】已成功将国服 4K 中文字库挂载为韩服主字体的后备链 (m_FallbackFontAssetTable)！");
-                                        s_fallback_injected = true; // 功成身退，永久锁定不再重复注入
+                // 保险层 1 (战术打击)：直接把当前汉化了的文本控件的字体强制更替为中文 4K 字库
+                if (il2cpp_field_set_value) {
+                    il2cpp_field_set_value(__this, font_field, &china_font_asset_ptr);
+                }
+
+                // 保险层 2 (战略挂载)：尝试提取韩文主字体的后备链，并挂载进去 (Font Fallback)
+                if (!s_fallback_injected && il2cpp_field_get_value && il2cpp_class_get_method_from_name && il2cpp_runtime_invoke) {
+                    void* korean_main_font = nullptr;
+                    il2cpp_field_get_value(__this, font_field, &korean_main_font);
+                    
+                    if (korean_main_font) {
+                        void* font_klass = il2cpp_object_get_class(korean_main_font);
+                        if (font_klass) {
+                            void* fallback_field = find_field_in_hierarchy(font_klass, "m_FallbackFontAssetTable");
+                            if (fallback_field) {
+                                void* fallback_list_obj = nullptr;
+                                il2cpp_field_get_value(korean_main_font, fallback_field, &fallback_list_obj);
+                                
+                                if (fallback_list_obj) {
+                                    void* list_klass = il2cpp_object_get_class(fallback_list_obj);
+                                    if (list_klass) {
+                                        void* add_method = il2cpp_class_get_method_from_name(list_klass, "Add", 1);
+                                        if (add_method) {
+                                            void* args[1] = { china_font_asset_ptr };
+                                            il2cpp_runtime_invoke(add_method, fallback_list_obj, args, nullptr);
+                                            s_fallback_injected = true;
+                                            LOGI("[HACK_FONT] Global Fallback chain injected successfully!");
+                                        }
                                     }
                                 }
                             }
@@ -263,37 +298,29 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
         }
     }
 
-    // 照常把文本送回原始渲染。遇到没有汉字的韩文用原版图，遇到汉字自动去中文 4K 图里捞！
     old_set_text(__this, final_string);
 }
 
 // ==================== 突破改造后的核心启动器 ====================
 void hack_start(const char *game_data_dir) {
-    LOGI("hack_start started, entering deployment loop...");
-    hook_exit_functions(); // 提前安装防自杀 Hook
+    LOGI("[HACK_INIT] hack_start initiated.");
+    hook_exit_functions(); 
 
     uintptr_t il2cpp_base = 0;
     for (int i = 0; i < 300; i++) {
-        // 核心修复：直接从内存抓取最真实的物理分包路径
         std::string real_path = get_module_path_and_base("libil2cpp.so", il2cpp_base);
         
         if (!real_path.empty() && il2cpp_base != 0) {
-            LOGI("【核心发现】成功从内存抓取到 il2cpp 真实绝对路径: %s", real_path.c_str());
-            LOGI("【核心发现】安全捕获基地址: 0x%llx", (unsigned long long)il2cpp_base);
+            LOGI("[HACK_INIT] Found il2cpp path: %s", real_path.c_str());
+            LOGI("[HACK_INIT] Base address: 0x%llx", (unsigned long long)il2cpp_base);
             
-            // 三路闭环句柄加载机制
-            void *handle = xdl_open(real_path.c_str(), 0); // 1. 尝试绝对路径
-            if (!handle) {
-                handle = xdl_open("libil2cpp.so", 0);      // 2. 尝试标准盲搜
-            }
-            if (!handle) {
-                handle = dlopen(real_path.c_str(), RTLD_LAZY); // 3. 尝试原生 dlopen
-            }
+            void *handle = xdl_open(real_path.c_str(), 0); 
+            if (!handle) handle = xdl_open("libil2cpp.so", 0);      
+            if (!handle) handle = dlopen(real_path.c_str(), RTLD_LAZY); 
 
             if (handle) {
-                LOGI("【成功】libil2cpp.so 核心句柄接驳成功！开始绑定运行时接口...");
+                LOGI("[HACK_INIT] libil2cpp.so hooked successfully! Binding core symbols...");
                 
-                // 智能符号查找器
                 auto find_sym = [](void* h, const char* name) -> void* {
                     void* sym = xdl_sym(h, name, nullptr);
                     if (!sym) sym = dlsym(h, name);
@@ -305,28 +332,25 @@ void hack_start(const char *game_data_dir) {
                 il2cpp_object_get_class = (il2cpp_object_get_class_fn)find_sym(handle, "il2cpp_object_get_class");
                 il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_fn)find_sym(handle, "il2cpp_class_get_field_from_name");
                 il2cpp_field_set_value = (il2cpp_field_set_value_fn)find_sym(handle, "il2cpp_field_set_value");
-                il2cpp_field_get_value = (il2cpp_field_get_value_fn)find_sym(handle, "il2cpp_field_get_value"); // 【新增符号绑定】
-                il2cpp_class_get_method_from_name = (il2cpp_class_get_method_from_name_fn)find_sym(handle, "il2cpp_class_get_method_from_name"); // 【新增符号绑定】
-                il2cpp_runtime_invoke = (il2cpp_runtime_invoke_fn)find_sym(handle, "il2cpp_runtime_invoke"); // 【新增符号绑定】
+                il2cpp_field_get_value = (il2cpp_field_get_value_fn)find_sym(handle, "il2cpp_field_get_value"); 
+                il2cpp_class_get_method_from_name = (il2cpp_class_get_method_from_name_fn)find_sym(handle, "il2cpp_class_get_method_from_name"); 
+                il2cpp_runtime_invoke = (il2cpp_runtime_invoke_fn)find_sym(handle, "il2cpp_runtime_invoke"); 
                 il2cpp_class_get_name = (il2cpp_class_get_name_fn)find_sym(handle, "il2cpp_class_get_name");
+                il2cpp_class_get_parent = (il2cpp_class_get_parent_fn)find_sym(handle, "il2cpp_class_get_parent"); // 【核心绑定】
 
-                // 基建就位，立刻唤醒国服中文字库
                 if (il2cpp_resolve_icall != nullptr) {
                     load_chinese_font_asset();
                 }
 
-                // 进行 TextMeshPro 函数 Hook 挂载
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5b099c);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
-                LOGI("【成功】TextMeshPro::set_text 核心 Hook 部署完毕！");
+                LOGI("[HACK_INIT] TextMeshPro::set_text Hook deployed successfully.");
                 break;
             } else {
-                LOGE("【警报】已抓到路径，但所有句柄加载器均告失败，第 %d 次重试...", i);
+                LOGE("[HACK_INIT] Failed to open libil2cpp handle, retrying... (%d)", i);
             }
         } else {
-            if (i % 5 == 0) {
-                LOGI("【等待】libil2cpp.so 尚未被 Unity 加载进内存，持续监控中... (%d/300)", i);
-            }
+            if (i % 5 == 0) LOGI("[HACK_INIT] Waiting for libil2cpp.so to load... (%d/300)", i);
         }
         sleep(1);
     }
