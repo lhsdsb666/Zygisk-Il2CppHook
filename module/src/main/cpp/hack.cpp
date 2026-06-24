@@ -1,6 +1,6 @@
 //
 // Created by Perfare on 2020/7/4.
-// 优化精简版 hack.cpp (彻底修复方块字与全局解耦进化版)
+// 优化精简版 hack.cpp (彻底修复方块字与全局解耦进化版 - 强力日志诊断版)
 //
 
 #include "hack.h"
@@ -166,53 +166,82 @@ void* find_field_in_hierarchy(void* klass, const char* field_name) {
     return nullptr;
 }
 
-// ==================== 外部字库唤醒模块 ====================
+// ==================== 外部字库唤醒模块（强力诊断版） ====================
 static bool g_font_loaded = false;
 void load_chinese_font_asset() {
-    if (g_font_loaded || !il2cpp_resolve_icall || !il2cpp_string_new) return;
+    if (g_font_loaded) return;
+    LOGI("[HACK_FONT] Entering load_chinese_font_asset...");
 
-    Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadFromFile_Internal(System.String,System.UInt32,System.UInt64)");
-    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.String,System.Type)"); 
-    if (!Unity_LoadAllAssets) {
-        Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.Type)");
+    if (!il2cpp_resolve_icall || !il2cpp_string_new) {
+        LOGE("[HACK_FONT] ERROR: il2cpp core functions are NULL!");
+        g_font_loaded = true;
+        return;
     }
 
-    if (Unity_LoadFromFile && Unity_LoadAllAssets) {
-        const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
-        const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans";
+    // 尝试解析加载函数（自适应兼容多种 Unity 内部底层方法名）
+    Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadFromFile_Internal(System.String,System.UInt32,System.UInt64)");
+    if (!Unity_LoadFromFile) {
+        LOGI("[HACK_FONT] [WARNING] Standard LoadFromFile signature failed, trying short signature...");
+        Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadFromFile_Internal");
+    }
 
-        void* font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_external), 0, 0);
-        if (!font_bundle) {
-            font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_internal), 0, 0);
-        }
+    // 尝试解析资源获取函数（自适应三重保底）
+    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.String,System.Type)"); 
+    if (!Unity_LoadAllAssets) {
+        LOGI("[HACK_FONT] [WARNING] Standard LoadAllAssets signature failed, trying alternative 1...");
+        Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal(System.Type)");
+    }
+    if (!Unity_LoadAllAssets) {
+        LOGI("[HACK_FONT] [WARNING] Alternative 1 failed, trying alternative 2...");
+        Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)il2cpp_resolve_icall("UnityEngine.AssetBundle::LoadAllAssets_Internal");
+    }
 
-        if (font_bundle) {
-            LOGI("[HACK_FONT] AssetBundle loaded successfully.");
-            void* assets_array = Unity_LoadAllAssets(font_bundle, nullptr);
-            if (assets_array) {
-                int32_t array_length = *(int32_t*)((uintptr_t)assets_array + 0x18);
-                if (array_length <= 0 || array_length > 100) array_length = 10; 
+    // 核心诊断：到底是谁解不出符号
+    if (!Unity_LoadFromFile || !Unity_LoadAllAssets) {
+        LOGE("[HACK_FONT] ERROR: Unity AssetBundle APIs not found! LoadFromFile: %p, LoadAllAssets: %p", Unity_LoadFromFile, Unity_LoadAllAssets);
+        g_font_loaded = true;
+        return;
+    }
 
-                for (int i = 0; i < array_length; i++) {
-                    void* test_ptr = ((void**)assets_array)[4 + i];
-                    if (test_ptr && il2cpp_object_get_class && il2cpp_class_get_name) {
-                        if ((uintptr_t)test_ptr < 0x100000) continue; 
-                        
-                        void* klass = il2cpp_object_get_class(test_ptr);
-                        if (!klass) continue;
-                        const char* class_name = il2cpp_class_get_name(klass);
-                        
-                        if (class_name && (strstr(class_name, "FontAsset") != nullptr || strstr(class_name, "TMP_Font") != nullptr)) {
-                            china_font_asset_ptr = test_ptr;
-                            LOGI("[HACK_FONT] Target font intercepted! Ptr: %p", china_font_asset_ptr);
-                            break; 
-                        }
+    const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
+    const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans";
+
+    LOGI("[HACK_FONT] Trying to load AssetBundle from external path: %s", path_external);
+    void* font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_external), 0, 0);
+    if (!font_bundle) {
+        LOGI("[HACK_FONT] External path failed, trying internal path: %s", path_internal);
+        font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_internal), 0, 0);
+    }
+
+    if (font_bundle) {
+        LOGI("[HACK_FONT] AssetBundle loaded successfully! Exhuming assets...");
+        void* assets_array = Unity_LoadAllAssets(font_bundle, nullptr);
+        if (assets_array) {
+            int32_t array_length = *(int32_t*)((uintptr_t)assets_array + 0x18);
+            LOGI("[HACK_FONT] Found %d assets in bundle.", array_length);
+            if (array_length <= 0 || array_length > 100) array_length = 10; 
+
+            for (int i = 0; i < array_length; i++) {
+                void* test_ptr = ((void**)assets_array)[4 + i];
+                if (test_ptr && il2cpp_object_get_class && il2cpp_class_get_name) {
+                    if ((uintptr_t)test_ptr < 0x100000) continue; 
+                    
+                    void* klass = il2cpp_object_get_class(test_ptr);
+                    if (!klass) continue;
+                    const char* class_name = il2cpp_class_get_name(klass);
+                    
+                    if (class_name && (strstr(class_name, "FontAsset") != nullptr || strstr(class_name, "TMP_Font") != nullptr)) {
+                        china_font_asset_ptr = test_ptr;
+                        LOGI("[HACK_FONT] SUCCESS: Target font intercepted! Ptr: %p", china_font_asset_ptr);
+                        break; 
                     }
                 }
             }
         } else {
-            LOGE("[HACK_FONT] ERROR: Cannot open font file zh-hans!");
+            LOGE("[HACK_FONT] ERROR: LoadAllAssets returned NULL!");
         }
+    } else {
+        LOGE("[HACK_FONT] CRITICAL ERROR: Cannot open font file zh-hans from both paths! Check file permissions or path.");
     }
     g_font_loaded = true;
 }
@@ -238,7 +267,7 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
         }
     }
 
-    // 【核心进化】解耦逻辑：只要外部中文中文字库加载成功，便针对每一个渲染文本实施拦截检测
+    // 解耦逻辑：只要外部中文字库加载成功，便针对每一个渲染文本实施拦截检测
     if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class) {
         void* text_klass = il2cpp_object_get_class(__this);
         if (text_klass) {
@@ -319,13 +348,13 @@ void hack_start(const char *game_data_dir) {
                 il2cpp_class_get_name = (il2cpp_class_get_name_fn)find_sym(handle, "il2cpp_class_get_name");
                 il2cpp_class_get_parent = (il2cpp_class_get_parent_fn)find_sym(handle, "il2cpp_class_get_parent"); 
 
-                if (il2cpp_resolve_icall != nullptr) {
-                    load_chinese_font_asset();
-                }
-
+                // 挂载核心文本渲染 Hook
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5b099c);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("[HACK_INIT] Hook deployed successfully.");
+                
+                // 【调整移至末尾】确保上面的所有底层符号指针全部解析完毕，再唤醒字库加载
+                load_chinese_font_asset();
                 break;
             }
         }
