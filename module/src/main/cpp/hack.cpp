@@ -160,7 +160,7 @@ void* find_field_in_hierarchy(void* klass, const char* field_name) {
     return nullptr;
 }
 
-// ==================== 外部字库唤醒模块（最小改动版） ====================
+// ==================== 外部字库唤醒模块 ====================
 static bool g_font_loaded = false;
 void load_chinese_font_asset(uintptr_t il2cpp_base) {
     if (g_font_loaded) return;
@@ -175,10 +175,10 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
     Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)(il2cpp_base + 0xb64fe38);
     Unity_LoadAsset = (AssetBundle_LoadAsset_t)(il2cpp_base + 0xb650040);
 
-    const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans.assetbundle";
-    const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans.assetbundle";
+    const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
+    const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans";
 
-    LOGI("[HACK_FONT] Trying to load AssetBundle...");
+    LOGI("[HACK_FONT] Trying to load font file: %s", path_external);
     void* font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_external));
     if (!font_bundle) {
         font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_internal));
@@ -186,7 +186,8 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
 
     if (font_bundle) {
         LOGI("[HACK_FONT] AssetBundle loaded!");
-        
+        sleep(2);  // 增加延迟减少闪退
+
         const char* names[] = {"zh-hans", "ZH-HANS", "SystemFont", "font", "zh_hans"};
         for (int i = 0; i < 5; i++) {
             china_font_asset_ptr = Unity_LoadAsset(font_bundle, il2cpp_string_new(names[i]), nullptr);
@@ -197,10 +198,10 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
         }
 
         if (!china_font_asset_ptr) {
-            LOGE("[HACK_FONT] ERROR: Failed to load any asset name variant!");
+            LOGE("[HACK_FONT] Failed to load any asset name!");
         }
     } else {
-        LOGE("[HACK_FONT] CRITICAL ERROR: Cannot open zh-hans.assetbundle");
+        LOGE("[HACK_FONT] Failed to load zh-hans font file!");
     }
     g_font_loaded = true;
 }
@@ -211,7 +212,6 @@ static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullp
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     MyIl2CppString* final_string = il2cpp_string;
 
-    // 1. 文本翻译
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string origin_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         auto it = translation_dict.find(origin_text);
@@ -223,7 +223,7 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
         }
     }
 
-    // 2. 强制替换为中文字体（即使 fallback size=0 也生效）
+    // 强制替换中文字体
     if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class && il2cpp_field_set_value) {
         void* text_klass = il2cpp_object_get_class(__this);
         if (text_klass) {
@@ -280,7 +280,7 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
-// ==================== 原封不动的底层适配与桥接代码 ====================
+// ==================== 原封不动的底层适配代码（保持不变） ====================
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
