@@ -1,6 +1,6 @@
 //
 // Created by Perfare on 2020/7/4.
-// 彻底解决闪退——无参 LoadAllAssets 数组直取版
+// 彻底修复闪退与全局解耦进化版 (寄存器对齐修正版)
 //
 
 #include "hack.h"
@@ -23,21 +23,12 @@
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
-// ==================== Unity 底层数据结构 ====================
+// ==================== Unity 底层字符串结构与 API 定义 ====================
 struct MyIl2CppString {
     void* klass;
     void* monitor;
     int32_t length;
     char16_t chars[0]; 
-};
-
-// Unity 底层托管数组结构
-struct MyIl2CppArray {
-    void* klass;
-    void* monitor;
-    void* bounds;
-    intmax_t max_length; // 数组长度
-    void* vector[0];     // 真正存储指针的数据区域（32字节偏移处）
 };
 
 typedef MyIl2CppString* (*il2cpp_string_new_ptr)(const char* text);
@@ -58,15 +49,13 @@ static il2cpp_field_get_value_fn il2cpp_field_get_value = nullptr;
 static il2cpp_class_get_name_fn il2cpp_class_get_name = nullptr;
 static il2cpp_class_get_parent_fn il2cpp_class_get_parent = nullptr; 
 
-// ==================== 核心加载 API 原型 ====================
 typedef void* (*AssetBundle_LoadFromFile_t)(MyIl2CppString* path);
-// 切换为 LoadAllAssets，只有 1 个 __this 参数，完美免疫寄存器崩塌
-typedef MyIl2CppArray* (*AssetBundle_LoadAllAssets_t)(void* __this);
+typedef void* (*AssetBundle_LoadAsset_t)(void* __this, MyIl2CppString* name, void* method_info);
 
 static AssetBundle_LoadFromFile_t Unity_LoadFromFile = nullptr;
-static AssetBundle_LoadAllAssets_t Unity_LoadAllAssets = nullptr;
+static AssetBundle_LoadAsset_t Unity_LoadAsset = nullptr;
 
-// ==================== 汉化字典 ====================
+// ==================== 简易汉化字典 ====================
 static const std::unordered_map<std::string, std::string> translation_dict = {
     {"상점", "商店"},
     {"친구", "好友"},
@@ -131,7 +120,7 @@ std::string get_module_path_and_base(const char* module_name, uintptr_t& out_bas
     return "";
 }
 
-// ==================== Hook 退出函数（避开自杀拦截） ====================
+// ==================== Hook 退出函数（防反作弊自杀） ====================
 static void (*old_exit)(int status) = nullptr;
 static void (*old__exit)(int status) = nullptr;
 
@@ -154,6 +143,7 @@ void hook_exit_functions() {
     }
 }
 
+// ==================== 祖孙三代层级字段搜索器 ====================
 void* find_field_in_hierarchy(void* klass, const char* field_name) {
     void* field = nullptr;
     while (klass != nullptr) {
@@ -170,11 +160,11 @@ void* find_field_in_hierarchy(void* klass, const char* field_name) {
     return nullptr;
 }
 
-// ==================== 外部字库一锅端提取器（全新安全版） ====================
+// ==================== 外部字库唤醒模块（最小改动版） ====================
 static bool g_font_loaded = false;
 void load_chinese_font_asset(uintptr_t il2cpp_base) {
     if (g_font_loaded) return;
-    LOGI("[HACK_FONT] Entering load_chinese_font_asset via LoadAllAssets method...");
+    LOGI("[HACK_FONT] Entering load_chinese_font_asset...");
 
     if (!il2cpp_string_new) {
         LOGE("[HACK_FONT] ERROR: il2cpp_string_new is NULL!");
@@ -182,50 +172,46 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
         return;
     }
 
-    // 根据 dump 数据精准映射 RVA
     Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)(il2cpp_base + 0xb64fe38);
-    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)(il2cpp_base + 0xb65077c); // 修正为无参的 0xb65077c
-    const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
-    const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans";
+    Unity_LoadAsset = (AssetBundle_LoadAsset_t)(il2cpp_base + 0xb650040);
 
-    LOGI("[HACK_FONT] Trying to open AssetBundle file...");
+    const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans.assetbundle";
+    const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans.assetbundle";
+
+    LOGI("[HACK_FONT] Trying to load AssetBundle...");
     void* font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_external));
     if (!font_bundle) {
         font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_internal));
     }
 
     if (font_bundle) {
-        LOGI("[HACK_FONT] AssetBundle file open success! Executing LoadAllAssets globally...");
+        LOGI("[HACK_FONT] AssetBundle loaded!");
         
-        // 直接无参调用，绝对不会闪退
-        MyIl2CppArray* asset_array = Unity_LoadAllAssets(font_bundle);
-
-        if (asset_array && asset_array->max_length > 0) {
-            LOGI("[HACK_FONT] Success! Asset bundle unpack total: %ld items.", asset_array->max_length);
-            
-            // 数组的第一个元素即我们要抓取的本地中文字体包资产
-            china_font_asset_ptr = asset_array->vector[0];
-
+        const char* names[] = {"zh-hans", "ZH-HANS", "SystemFont", "font", "zh_hans"};
+        for (int i = 0; i < 5; i++) {
+            china_font_asset_ptr = Unity_LoadAsset(font_bundle, il2cpp_string_new(names[i]), nullptr);
             if (china_font_asset_ptr) {
-                LOGI("[HACK_FONT] SUCCESS: Target Chinese Font Asset Loaded! Pointer: %p", china_font_asset_ptr);
-            } else {
-                LOGE("[HACK_FONT] Error: First asset element pointer is null.");
+                LOGI("[HACK_FONT] SUCCESS: Loaded Chinese Font! Name: %s, Ptr: %p", names[i], china_font_asset_ptr);
+                break;
             }
-        } else {
-            LOGE("[HACK_FONT] Error: LoadAllAssets returned an empty or invalid array pointer.");
+        }
+
+        if (!china_font_asset_ptr) {
+            LOGE("[HACK_FONT] ERROR: Failed to load any asset name variant!");
         }
     } else {
-        LOGE("[HACK_FONT] CRITICAL ERROR: Cannot open 'zh-hans' file. Make sure file has NO extension name like .manifest");
+        LOGE("[HACK_FONT] CRITICAL ERROR: Cannot open zh-hans.assetbundle");
     }
     g_font_loaded = true;
 }
 
-// ==================== TextMeshPro 全局拦截替换器 ====================
+// ==================== TextMeshPro 全局降维拦截替换器 ====================
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     MyIl2CppString* final_string = il2cpp_string;
 
+    // 1. 文本翻译
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string origin_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         auto it = translation_dict.find(origin_text);
@@ -233,16 +219,16 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
             std::string translated_text = it->second;
             if (il2cpp_string_new != nullptr) {
                 final_string = il2cpp_string_new(translated_text.c_str());
-                LOGI("[HACK_TXT] Match found in dict.");
             }
         }
     }
 
-    if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class) {
+    // 2. 强制替换为中文字体（即使 fallback size=0 也生效）
+    if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class && il2cpp_field_set_value) {
         void* text_klass = il2cpp_object_get_class(__this);
         if (text_klass) {
             void* font_field = find_field_in_hierarchy(text_klass, "m_fontAsset");
-            if (font_field && il2cpp_field_set_value) {
+            if (font_field) {
                 il2cpp_field_set_value(__this, font_field, &china_font_asset_ptr);
             }
         }
@@ -282,7 +268,6 @@ void hack_start(const char *game_data_dir) {
                 il2cpp_class_get_name = (il2cpp_class_get_name_fn)find_sym(handle, "il2cpp_class_get_name");
                 il2cpp_class_get_parent = (il2cpp_class_get_parent_fn)find_sym(handle, "il2cpp_class_get_parent"); 
 
-                // 挂载文本替换拦截 Hook
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5b099c);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("[HACK_INIT] Hook deployed successfully.");
@@ -295,7 +280,7 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
-// ==================== 底层适配桥接代码 ====================
+// ==================== 原封不动的底层适配与桥接代码 ====================
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
