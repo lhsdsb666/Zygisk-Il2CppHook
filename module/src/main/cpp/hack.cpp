@@ -166,8 +166,8 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
     if (g_font_loaded) return;
     g_font_loaded = true;
 
-    LOGI("[HACK_FONT] Starting font load (delayed)...");
-    sleep(8);   // 大幅增加延迟，让logo和初始界面加载完
+    LOGI("[HACK_FONT] Starting font load (delayed 8s)...");
+    sleep(8);
 
     if (!il2cpp_string_new) {
         LOGE("[HACK_FONT] il2cpp_string_new is NULL!");
@@ -195,7 +195,7 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
             return;
         }
     }
-    LOGE("[HACK_FONT] Failed to load asset");
+    LOGE("[HACK_FONT] Failed to load asset name");
 }
 
 // ==================== TextMeshPro Hook ====================
@@ -205,7 +205,10 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (!g_font_loaded) {
         uintptr_t base = 0;
         get_module_path_and_base("libil2cpp.so", base);
-        if (base != 0) load_chinese_font_asset(base);
+        if (base != 0) {
+            LOGI("[HACK_FONT] First text render detected, loading font now...");
+            load_chinese_font_asset(base);
+        }
     }
 
     MyIl2CppString* final_string = il2cpp_string;
@@ -224,6 +227,7 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
             void* font_field = find_field_in_hierarchy(text_klass, "m_fontAsset");
             if (font_field) {
                 il2cpp_field_set_value(__this, font_field, &china_font_asset_ptr);
+                LOGI("[HACK_FONT] Font replaced for this text object!");
             }
         }
     }
