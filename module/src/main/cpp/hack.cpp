@@ -1,6 +1,6 @@
 //
 // Created by Perfare on 2020/7/4.
-// 优化精简版 hack.cpp (彻底修复方块字与全局解耦进化版 - 强力日志诊断版)
+// 彻底修复闪退与全局解耦进化版 (寄存器对齐修正版)
 //
 
 #include "hack.h"
@@ -37,7 +37,8 @@ static void* china_font_asset_ptr = nullptr;
 
 typedef void* (*il2cpp_object_get_class_fn)(void* obj);
 typedef void* (*il2cpp_class_get_field_from_name_fn)(void* klass, const char* name);
-typedef void (*il2cpp_field_set_value_fn)(void* obj, void* field, void* value);
+// 修改：修正底层赋值 API 原型，第三个参数传入指针的指针
+typedef void (*il2cpp_field_set_value_fn)(void* obj, void* field, void** value);
 typedef void (*il2cpp_field_get_value_fn)(void* obj, void* field, void* value); 
 typedef const char* (*il2cpp_class_get_name_fn)(void* klass);
 typedef void* (*il2cpp_class_get_parent_fn)(void* klass); 
@@ -49,9 +50,10 @@ static il2cpp_field_get_value_fn il2cpp_field_get_value = nullptr;
 static il2cpp_class_get_name_fn il2cpp_class_get_name = nullptr;
 static il2cpp_class_get_parent_fn il2cpp_class_get_parent = nullptr; 
 
-// 根据 Unity 6 的 dump.cs 还原真实的底层函数原型
+// 核心修正：静态方法保持原样
 typedef void* (*AssetBundle_LoadFromFile_t)(MyIl2CppString* path);
-typedef void* (*AssetBundle_LoadAsset_t)(void* __this, MyIl2CppString* name);
+// 核心修正：实例方法必须显式补上隐藏的 method_info 参数，防止 ARM64 寄存器错位导致闪退！
+typedef void* (*AssetBundle_LoadAsset_t)(void* __this, MyIl2CppString* name, void* method_info);
 
 static AssetBundle_LoadFromFile_t Unity_LoadFromFile = nullptr;
 static AssetBundle_LoadAsset_t Unity_LoadAsset = nullptr;
@@ -161,7 +163,7 @@ void* find_field_in_hierarchy(void* klass, const char* field_name) {
     return nullptr;
 }
 
-// ==================== 外部字库唤醒模块（RVA 暴力破局版） ====================
+// ==================== 外部字库唤醒模块（RVA 安全对齐版） ====================
 static bool g_font_loaded = false;
 void load_chinese_font_asset(uintptr_t il2cpp_base) {
     if (g_font_loaded) return;
@@ -173,37 +175,38 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
         return;
     }
 
-    // 直接通过 dump.cs 提供的确定 RVA 地址计算绝对指针，彻底解决 0x0 报错
+    // 根据你的 Unity 6 dump 结果精准赋值
     Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)(il2cpp_base + 0xb64fe38);
     Unity_LoadAsset = (AssetBundle_LoadAsset_t)(il2cpp_base + 0xb650040);
 
     const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
     const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans";
 
-    LOGI("[HACK_FONT] Trying to load AssetBundle from external path: %s", path_external);
+    LOGI("[HACK_FONT] Trying to load AssetBundle...");
     void* font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_external));
     if (!font_bundle) {
-        LOGI("[HACK_FONT] External path failed, trying internal path: %s", path_internal);
         font_bundle = Unity_LoadFromFile(il2cpp_string_new(path_internal));
     }
 
     if (font_bundle) {
-        LOGI("[HACK_FONT] AssetBundle loaded successfully! Exhuming font asset via RVA LoadAsset...");
+        LOGI("[HACK_FONT] AssetBundle loaded! Exhuming asset safely with method_info=nullptr...");
         
-        // Unity 6000 单个读取需要资产别名。默认尝试使用 "zh-hans"，若失败转为尝试通用的 "font"
-        china_font_asset_ptr = Unity_LoadAsset(font_bundle, il2cpp_string_new("zh-hans"));
+        // 依次尝试不同的大小写与命名变体，末尾必须传入 nullptr 对齐寄存器
+        china_font_asset_ptr = Unity_LoadAsset(font_bundle, il2cpp_string_new("zh-hans"), nullptr);
         if (!china_font_asset_ptr) {
-            LOGI("[HACK_FONT] Asset name 'zh-hans' not found, trying fallback asset name 'font'...");
-            china_font_asset_ptr = Unity_LoadAsset(font_bundle, il2cpp_string_new("font"));
+            china_font_asset_ptr = Unity_LoadAsset(font_bundle, il2cpp_string_new("ZH-HANS"), nullptr);
+        }
+        if (!china_font_asset_ptr) {
+            china_font_asset_ptr = Unity_LoadAsset(font_bundle, il2cpp_string_new("font"), nullptr);
         }
 
         if (china_font_asset_ptr) {
             LOGI("[HACK_FONT] SUCCESS: Target Chinese Font Asset Loaded! Ptr: %p", china_font_asset_ptr);
         } else {
-            LOGE("[HACK_FONT] ERROR: LoadAsset returned NULL! Please ensure the font asset inside Unity bundle is named 'zh-hans' or 'font'.");
+            LOGE("[HACK_FONT] ERROR: All asset name variants returned NULL! Check inside your AssetBundle.");
         }
     } else {
-        LOGE("[HACK_FONT] CRITICAL ERROR: Cannot open font file zh-hans from both paths! Check file permissions.");
+        LOGE("[HACK_FONT] CRITICAL ERROR: Cannot open font file 'zh-hans' from paths.");
     }
     g_font_loaded = true;
 }
@@ -222,18 +225,18 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
             std::string translated_text = it->second;
             if (il2cpp_string_new != nullptr) {
                 final_string = il2cpp_string_new(translated_text.c_str());
-                LOGI("[HACK_TXT] Translated: %s -> %s", origin_text.c_str(), translated_text.c_str());
+                LOGI("[HACK_TXT] Match found in dict.");
             }
         }
     }
 
-    // 2. 核心大招：全面放逐韩文。只要中文字库加载成功，每一个正在渲染的文本组件无条件强行认中文字库为主字体！
+    // 2. 核心大招：强行认中文字库为主字体
     if (china_font_asset_ptr != nullptr && __this != nullptr && il2cpp_object_get_class) {
         void* text_klass = il2cpp_object_get_class(__this);
         if (text_klass) {
             void* font_field = find_field_in_hierarchy(text_klass, "m_fontAsset");
             if (font_field && il2cpp_field_set_value) {
-                // 彻底抛弃复杂的备用追加(Fallback)，直接一锅端覆盖主字体，方块字根源直接断绝
+                // 传入字库指针的地址
                 il2cpp_field_set_value(__this, font_field, &china_font_asset_ptr);
             }
         }
