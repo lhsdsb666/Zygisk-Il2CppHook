@@ -184,8 +184,7 @@ void load_chinese_font_asset(uintptr_t il2cpp_base) {
 
     // 根据 dump 数据精准映射 RVA
     Unity_LoadFromFile = (AssetBundle_LoadFromFile_t)(il2cpp_base + 0xb64fe38);
-    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)(il2cpp_base + 0xb6507ec); // 换成全新安全的 LoadAllAssets
-
+    Unity_LoadAllAssets = (AssetBundle_LoadAllAssets_t)(il2cpp_base + 0xb65077c); // 修正为无参的 0xb65077c
     const char* path_external = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/zh-hans";
     const char* path_internal = "/data/data/com.epidgames.trickcalrevive/files/zh-hans";
 
