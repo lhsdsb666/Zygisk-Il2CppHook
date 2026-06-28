@@ -1,6 +1,6 @@
 //
-// Created by Perfare on 2020/7/4.
-// 极致精简内存版 - 韩文无痛完美变方块
+// 极致精简内存版 - 韩文完美变汉字/方块
+// Target: Trickcal Re:VIVE (TextMeshPro 大写 SetText 挂载)
 //
 
 #include "hack.h"
@@ -62,12 +62,12 @@ static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullp
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
-        // 直接在内存中遍历字符，将所有韩文音节和字母无条件替换为标准方块字 '□' (0x25A1)
+        // 遍历字符，将所有韩文音节和字母强制替换为标准方块字 '□' (Unicode: 0x25A1)
         for (int i = 0; i < il2cpp_string->length; i++) {
             char16_t c = il2cpp_string->chars[i];
-            // 韩文 Unicode 常用范围：音节 (AC00-D7A3)、字母 (1100-11FF)、兼容字母 (3130-318F)
+            // 韩文 Unicode 常用范围
             if ((c >= 0xAC00 && c <= 0xD7A3) || (c >= 0x1100 && c <= 0x11FF) || (c >= 0x3130 && c <= 0x318F)) {
-                il2cpp_string->chars[i] = 0x25A1; // 强制变方块
+                il2cpp_string->chars[i] = 0x25A1; 
             }
         }
     }
@@ -76,7 +76,7 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
 
 // 核心启动器
 void hack_start(const char *game_data_dir) {
-    (void)game_data_dir; // 压制 GitHub CI 未使用变量警告
+    (void)game_data_dir; 
     LOGI("[HACK_INIT] hack_start initiated.");
 
     uintptr_t il2cpp_base = 0;
@@ -84,10 +84,10 @@ void hack_start(const char *game_data_dir) {
         std::string real_path = get_module_path_and_base("libil2cpp.so", il2cpp_base);
         
         if (!real_path.empty() && il2cpp_base != 0) {
-            LOGI("[HACK_INIT] libil2cpp.so bound successfully. Base: %p", (void*)il2cpp_base);
+            LOGI("[HACK_INIT] libil2cpp.so bound successfully.");
 
-            // 挂载文本渲染 Hook (根据你的 dump 确定的 TextMeshPro.set_text RVA 偏移)
-            void* set_text_addr = (void*)(il2cpp_base + 0xb5b099c);
+            // 【核心修改点】：使用刚刚在 dump.cs 抓到的真正大写 SetText(String) 的 RVA 地址 0xb5b5760
+            void* set_text_addr = (void*)(il2cpp_base + 0xb5b5760);
             DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
             LOGI("[HACK_INIT] Hook deployed successfully. Target: %p", set_text_addr);
             break;
@@ -96,7 +96,7 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
-// ==================== 模拟器环境底层适配与桥接代码（不可删除） ====================
+// ==================== 模拟器环境底层适配（保留以确保在 MuMu 12 稳定运行） ====================
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
