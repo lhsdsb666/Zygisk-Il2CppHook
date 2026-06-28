@@ -53,7 +53,7 @@ void hook_exit_functions() {
     LOGI("【Hook】Exit blocker active.");
 }
 
-// ==================== TextMeshPro 核心拦截与视觉修改 ====================
+// ==================== TextMeshPro 文本拦截器 ====================
 struct MyIl2CppString {
     void* klass;
     void* monitor;
@@ -61,7 +61,7 @@ struct MyIl2CppString {
     char16_t chars[0]; 
 };
 
-// UTF-16 转 UTF-8 用于 CMD 正常显示
+// UTF-16 转 UTF-8
 std::string utf16_to_utf8(const char16_t* utf16, int len) {
     std::string utf8;
     for (int i = 0; i < len; ++i) {
@@ -84,23 +84,14 @@ static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullp
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
+        // 转换出真实的原文内容
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         
-        // 【特性 1】：多重循环强制向 CMD 输出日志，达到疯狂刷屏、绝不漏看的效果
-        for (int i = 0; i < 3; ++i) {
-            LOGI("========================================================");
-            LOGI("💥💥💥【TEXT HOOK HIT !!】💥💥💥");
-            LOGI("目标指针: %p | 文本字数: %d", __this, il2cpp_string->length);
-            LOGI("捕获原文本内容 -> : %s", original_text.c_str());
-            LOGI("========================================================");
-        }
-
-        // 【特性 2】：暴力视觉显形！把游戏内存里的字符原地全部改写为方块 '□'
-        for (int i = 0; i < il2cpp_string->length; ++i) {
-            il2cpp_string->chars[i] = 0x25A1; // 0x25A1 是标准正方形 '□' 的 Unicode 编码
-        }
+        // 【优化】：极致精简的单行输出，去掉了爆炸特效，一眼就能看清文本，极方便复制
+        LOGI("[Text Capture] Len: %d | Content: %s", il2cpp_string->length, original_text.c_str());
     }
-    // 放行（此时发给游戏的已经是满屏的方块了）
+    
+    // 纯洁放行，不修改任何内存，确保游戏和后续日志都能看到正常的韩文原文
     old_set_text(__this, il2cpp_string);
 }
 
@@ -112,10 +103,10 @@ void hack_start(const char *game_data_dir) {
             hook_exit_functions();
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
             if (il2cpp_base != 0) {
-                // 【核心修复】：挂钩全新的、经过版本验证的 TMP_Text::set_text 真实偏移
+                // 使用最新提取验证的有效 RVA 偏移地址
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5157f0);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
-                LOGI("【核心大功告成】目标新地址挂钩完成！地址: %p", set_text_addr);
+                LOGI("【成功】TextMeshPro::set_text 挂钩完成");
             }
             break;
         }
@@ -123,7 +114,7 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
-// ==================== 以下为模拟器环境兼容代码（不可删减） ====================
+// ==================== 以下为模拟器环境兼容代码 ====================
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr; vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
