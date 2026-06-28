@@ -1,6 +1,5 @@
 //
-// 极致精简内存版 - 韩文完美变汉字/方块
-// Target: Trickcal Re:VIVE (TextMeshPro 大写 SetText 挂载)
+// 终极汉化双挂载版 - 带日志监控与中文字典测试
 //
 
 #include "hack.h"
@@ -30,6 +29,82 @@ struct MyIl2CppString {
     char16_t chars[0]; 
 };
 
+// 工具函数：将 Unity 的 UTF-16 文本安全转换成 UTF-8 用于 CMD 日志打印
+std::string utf16_to_utf8(const char16_t* str, int len) {
+    std::string utf8;
+    for (int i = 0; i < len; ++i) {
+        uint32_t cp = str[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < len) {
+            uint32_t trail = str[i + 1];
+            if (trail >= 0xDC00 && trail <= 0xDFFF) {
+                cp = ((cp - 0xD800) << 10) + (trail - 0xDC00) + 0x10000;
+                ++i;
+            }
+        }
+        if (cp <= 0x7F) { utf8 += (char)cp; } 
+        else if (cp <= 0x7FF) { utf8 += (char)(0xC0 | ((cp >> 6) & 0x1F)); utf8 += (char)(0x80 | (cp & 0x3F)); } 
+        else if (cp <= 0xFFFF) { utf8 += (char)(0xE0 | ((cp >> 12) & 0x0F)); utf8 += (char)(0x80 | ((cp >> 6) & 0x3F)); utf8 += (char)(0x80 | (cp & 0x3F)); } 
+        else { utf8 += (char)(0xF0 | ((cp >> 18) & 0x07)); utf8 += (char)(0x80 | ((cp >> 12) & 0x3F)); utf8 += (char)(0x80 | ((cp >> 6) & 0x3F)); utf8 += (char)(0x80 | (cp & 0x3F)); }
+    }
+    return utf8;
+}
+
+// 核心汉化字典过滤器
+void process_text_translation(MyIl2CppString* il2cpp_string) {
+    if (il2cpp_string == nullptr || il2cpp_string->length <= 0) return;
+
+    // 转换成标准字符串用于比对和打日志
+    std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
+    bool translated = false;
+    std::string target_text = "";
+
+    // 【测试字典】原地安全汉化替换（长度需要严格对齐以保障内存绝对安全）
+    if (original_text == "모험") {          // 主界面：冒险
+        il2cpp_string->chars[0] = 0x5192; // 冒
+        il2cpp_string->chars[1] = 0x9669; // 险
+        target_text = "冒险"; translated = true;
+    } else if (original_text == "모집") {   // 主界面：招募
+        il2cpp_string->chars[0] = 0x62DB; // 招
+        il2cpp_string->chars[1] = 0x5E55; // 募
+        target_text = "招募"; translated = true;
+    } else if (original_text == "카드") {   // 主界面：卡牌
+        il2cpp_string->chars[0] = 0x5361; // 卡
+        il2cpp_string->chars[1] = 0x724C; // 牌
+        target_text = "卡牌"; translated = true;
+    }
+
+    // 打印到电脑 CMD 的日志输出控制
+    if (translated) {
+        LOGI("[HACK_INIT] 【成功汉化】 %s -> %s", original_text.data(), target_text.data());
+    } else {
+        // 如果不是上面三个词，且包含韩文，就打印未翻译报告
+        bool has_korean = false;
+        for (int i = 0; i < il2cpp_string->length; i++) {
+            char16_t c = il2cpp_string->chars[i];
+            if ((c >= 0xAC00 && c <= 0xD7A3) || (c >= 0x1100 && c <= 0x11FF) || (c >= 0x3130 && c <= 0x318F)) {
+                has_korean = true; break;
+            }
+        }
+        if (has_korean) {
+            LOGI("[HACK_INIT] 【未翻译文本】内容: %s", original_text.data());
+        }
+    }
+}
+
+// 两个不同渲染入口的拦截器
+static void (*old_set_text_prop)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
+static void (*old_SetText_method)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
+
+void my_set_text_prop(void* __this, MyIl2CppString* il2cpp_string) {
+    process_text_translation(il2cpp_string);
+    old_set_text_prop(__this, il2cpp_string);
+}
+
+void my_SetText_method(void* __this, MyIl2CppString* il2cpp_string) {
+    process_text_translation(il2cpp_string);
+    old_SetText_method(__this, il2cpp_string);
+}
+
 // 获取模块基址
 std::string get_module_path_and_base(const char* module_name, uintptr_t& out_base) {
     out_base = 0;
@@ -38,40 +113,18 @@ std::string get_module_path_and_base(const char* module_name, uintptr_t& out_bas
     if (fp != nullptr) {
         while (fgets(line, sizeof(line), fp)) {
             if (strstr(line, module_name) != nullptr) {
-                if (out_base == 0) {
-                    out_base = strtoul(line, nullptr, 16);
-                }
+                if (out_base == 0) { out_base = strtoul(line, nullptr, 16); }
                 char* path_start = strchr(line, '/');
                 if (path_start) {
                     std::string path(path_start);
-                    while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) {
-                        path.pop_back();
-                    }
-                    fclose(fp);
-                    return path;
+                    while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) { path.pop_back(); }
+                    fclose(fp); return path;
                 }
             }
         }
         fclose(fp);
     }
     return "";
-}
-
-// TextMeshPro 文本拦截器
-static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
-
-void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
-    if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
-        // 遍历字符，将所有韩文音节和字母强制替换为标准方块字 '□' (Unicode: 0x25A1)
-        for (int i = 0; i < il2cpp_string->length; i++) {
-            char16_t c = il2cpp_string->chars[i];
-            // 韩文 Unicode 常用范围
-            if ((c >= 0xAC00 && c <= 0xD7A3) || (c >= 0x1100 && c <= 0x11FF) || (c >= 0x3130 && c <= 0x318F)) {
-                il2cpp_string->chars[i] = 0x25A1; 
-            }
-        }
-    }
-    old_set_text(__this, il2cpp_string);
 }
 
 // 核心启动器
@@ -86,20 +139,24 @@ void hack_start(const char *game_data_dir) {
         if (!real_path.empty() && il2cpp_base != 0) {
             LOGI("[HACK_INIT] libil2cpp.so bound successfully.");
 
-            // 【核心修改点】：使用刚刚在 dump.cs 抓到的真正大写 SetText(String) 的 RVA 地址 0xb5b5760
-            void* set_text_addr = (void*)(il2cpp_base + 0xb5b5760);
-            DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
-            LOGI("[HACK_INIT] Hook deployed successfully. Target: %p", set_text_addr);
+            // 通道 1：挂载小写属性 setter (0xb5b099c) -> 阻击大部分大厅静态 UI
+            void* prop_addr = (void*)(il2cpp_base + 0xb5b099c);
+            DobbyHook(prop_addr, (void*)my_set_text_prop, (void**)&old_set_text_prop);
+
+            // 通道 2：挂载大写标准方法 (0xb5b5760) -> 阻击动态刷新文本
+            void* method_addr = (void*)(il2cpp_base + 0xb5b5760);
+            DobbyHook(method_addr, (void*)my_SetText_method, (void**)&old_SetText_method);
+
+            LOGI("[HACK_INIT] Dual-Channel Hook deployed successfully.");
             break;
         }
         sleep(1);
     }
 }
 
-// ==================== 模拟器环境底层适配（保留以确保在 MuMu 12 稳定运行） ====================
+// ==================== 模拟器环境底层适配 ====================
 std::string GetLibDir(JavaVM *vms) {
-    JNIEnv *env = nullptr;
-    vms->AttachCurrentThread(&env, nullptr);
+    JNIEnv *env = nullptr; vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
     if (activity_thread_clz != nullptr) {
         jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz, "currentApplication", "()Landroid/app/Application;");
@@ -114,9 +171,7 @@ std::string GetLibDir(JavaVM *vms) {
                     if (native_library_dir_id) {
                         auto native_library_dir_jstring = (jstring) env->GetObjectField(application_info, native_library_dir_id);
                         auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        std::string lib_dir(path);
-                        env->ReleaseStringUTFChars(native_library_dir_jstring, path);
-                        return lib_dir;
+                        std::string lib_dir(path); env->ReleaseStringUTFChars(native_library_dir_jstring, path); return lib_dir;
                     }
                 }
             }
@@ -132,26 +187,20 @@ static std::string GetNativeBridgeLibrary() {
 }
 
 struct NativeBridgeCallbacks {
-    uint32_t version; void *initialize;
-    void *(*loadLibrary)(const char *libpath, int flag);
+    uint32_t version; void *initialize; void *(*loadLibrary)(const char *libpath, int flag);
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
     void *isSupported; void *getAppEnv; void *isCompatibleWith; void *getSignalHandler;
     void *unloadLibrary; void *getError; void *isPathSupported; void *initAnonymousNamespace;
-    void *createNamespace; void *linkNamespaces;
-    void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
+    void *createNamespace; void *linkNamespaces; void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    sleep(5);
-    auto libart = dlopen("libart.so", RTLD_NOW);
+    sleep(5); auto libart = dlopen("libart.so", RTLD_NOW);
     auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart, "JNI_GetCreatedJavaVMs");
-    JavaVM *vms_buf[1]; JavaVM *vms; jsize num_vms;
-    jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
+    JavaVM *vms_buf[1]; JavaVM *vms; jsize num_vms; jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
     if (status == JNI_OK && num_vms > 0) { vms = vms_buf[0]; } else { return false; }
-    auto lib_dir = GetLibDir(vms);
-    if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) { munmap(data, length); return false; }
-    auto nb = dlopen("libhoudini.so", RTLD_NOW);
-    if (!nb) { auto native_bridge = GetNativeBridgeLibrary(); nb = dlopen(native_bridge.data(), RTLD_NOW); }
+    auto lib_dir = GetLibDir(vms); if (lib_dir.empty() || lib_dir.find("/lib/x86") != std::string::npos) { munmap(data, length); return false; }
+    auto nb = dlopen("libhoudini.so", RTLD_NOW); if (!nb) { auto native_bridge = GetNativeBridgeLibrary(); nb = dlopen(native_bridge.data(), RTLD_NOW); }
     if (nb) {
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
@@ -183,8 +232,7 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 #if defined(__arm__) || defined(__aarch64__)
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *) reserved;
-    std::thread hack_thread(hack_start, game_data_dir);
-    hack_thread.detach();
+    std::thread hack_thread(hack_start, game_data_dir);   hack_thread.detach();
     return JNI_VERSION_1_6;
 }
 #endif
