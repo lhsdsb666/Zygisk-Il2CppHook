@@ -16,8 +16,9 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
-#include <cstdint> // 新增：确保 uintptr_t 全局可用，防止编译报错
-#include <string>  // 新增：确保 std::string 和字符串操作可用
+#include <cstdint> 
+#include <string>  
+#include <fstream>  // 新增：引入文件流头文件，用于将文本强制写入手机本地
 
 // ===== 核心黑科技：直接前置声明 Dobby 函数，免去引入 dobby.h 的麻烦，防止 GitHub 报找不到头文件错误 =====
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
@@ -95,7 +96,7 @@ void hook_exit_functions() {
     LOGI("【Hook】Exit functions hooked successfully");
 }
 
-// ==================== 核心新增：TextMeshPro 文本拦截器 ====================
+// ==================== TextMeshPro 文本拦截器 ====================
 // 1. 定义 Unity 底层的 C# 字符串结构体
 struct MyIl2CppString {
     void* klass;
@@ -138,20 +139,23 @@ std::string utf16_to_utf8(const char16_t* utf16, int len) {
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
-    // 只要游戏调用这个函数，就会在这里被我们抓个正着
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         // 将 C# 的 UTF-16 字符串转换为 C++ 的 UTF-8 字符串
         std::string text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         
-        // 核心打印：直接输出文本长度和文本内容！
+        // 通道 1：原本的 Logcat 打印（即使被系统掐断也不怕）
         LOGI("【文本拦截】长度: %d | 内容: %s", il2cpp_string->length, text.c_str());
         
-        // 💡 提示预留：以后要汉化文本时，就是在这里加判断并修改 il2cpp_string
+        // 通道 2（核心新增）：物理流落盘。直接写入游戏在手机本地的沙盒专属目录（无须存储权限）
+        std::ofstream outFile("/data/data/com.epidgames.trickcalrevive/files/dump_text.txt", std::ios_base::app);
+        if (outFile.is_open()) {
+            outFile << "长度: " << il2cpp_string->length << " | 内容: " << text << "\n";
+            outFile.close();
+        }
     }
     // 放行，让游戏照常显示文字
     old_set_text(__this, il2cpp_string);
 }
-// ========================================================
 
 
 void hack_start(const char *game_data_dir) {
@@ -181,9 +185,6 @@ void hack_start(const char *game_data_dir) {
             } else {
                 LOGE("【失败】未能获取到 il2cpp 基地址");
             }
-
-            // il2cpp_api_init(handle);
-            // il2cpp_hook();
             break;
         } else {
             sleep(1);
