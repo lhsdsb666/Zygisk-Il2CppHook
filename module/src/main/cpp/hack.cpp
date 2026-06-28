@@ -66,7 +66,7 @@ struct MyIl2CppString {
     char16_t chars[0]; 
 };
 
-// ===== 【修正：全局汉化字典与私有化造字函数指针，解决重名冲突】 =====
+// ===== 【全局汉化字典与私有化造字函数指针】 =====
 std::unordered_map<std::string, std::string> translation_map;
 static MyIl2CppString* (*il2cpp_string_new_ptr)(const char* str) = nullptr;
 
@@ -129,14 +129,17 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
         
         auto it = translation_map.find(original_text);
         if (it != translation_map.end()) {
-            LOGI("【汉化匹配】成功替换: %s -> %s", original_text.c_str(), it->second.c_str());
-            
-            // 使用我们更名后的私有造字指针
+            // 确保造字指针有效才算真正替换成功
             if (il2cpp_string_new_ptr != nullptr) {
                 MyIl2CppString* new_string = il2cpp_string_new_ptr(it->second.c_str());
                 if (new_string != nullptr) {
+                    LOGI("【汉化匹配】成功替换: %s -> %s", original_text.c_str(), it->second.c_str());
                     return old_set_text(__this, new_string);
+                } else {
+                    LOGI("【汉化错误】il2cpp_string_new 内存分配失败：%s", it->second.c_str());
                 }
+            } else {
+                LOGI("【汉化错误】无法替换！il2cpp_string_new 符号指针为空！");
             }
         } else {
             LOGI("【文本捕获】字数: %d | 内容: %s", il2cpp_string->length, original_text.c_str());
@@ -153,10 +156,13 @@ void hack_start(const char *game_data_dir) {
             hook_exit_functions();
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
             if (il2cpp_base != 0) {
-                void* il2cpp_handle = dlopen("libil2cpp.so", RTLD_LAZY);
-                if (il2cpp_handle != nullptr) {
-                    // 同样将获取到的函数句柄赋值给更名后的私有指针
-                    il2cpp_string_new_ptr = (MyIl2CppString* (*)(const char*))dlsym(il2cpp_handle, "il2cpp_string_new");
+                // 【核心修正】：直接使用已经成功打开的高级 xdl 句柄来寻找符号，拒绝不稳定的原生 dlopen
+                il2cpp_string_new_ptr = (MyIl2CppString* (*)(const char*))xdl_sym(handle, "il2cpp_string_new", nullptr);
+                
+                if (il2cpp_string_new_ptr != nullptr) {
+                    LOGI("【成功】成功通过 xdl 绑定 il2cpp_string_new，地址：%p", il2cpp_string_new_ptr);
+                } else {
+                    LOGI("【严重错误】未能通过 xdl 找到 il2cpp_string_new 符号！");
                 }
                 
                 load_translation_dict();
