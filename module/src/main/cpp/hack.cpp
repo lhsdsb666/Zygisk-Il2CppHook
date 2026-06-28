@@ -16,7 +16,7 @@
 #include <cstdint> 
 #include <string>  
 
-// ===== 【新增：汉化方案A所需工具箱】 =====
+// ===== 【汉化方案A所需工具箱】 =====
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -66,9 +66,9 @@ struct MyIl2CppString {
     char16_t chars[0]; 
 };
 
-// ===== 【新增：全局汉化字典与引擎造字函数指针】 =====
+// ===== 【修正：全局汉化字典与私有化造字函数指针，解决重名冲突】 =====
 std::unordered_map<std::string, std::string> translation_map;
-MyIl2CppString* (*il2cpp_string_new)(const char* str) = nullptr;
+static MyIl2CppString* (*il2cpp_string_new_ptr)(const char* str) = nullptr;
 
 // UTF-16 转 UTF-8
 std::string utf16_to_utf8(const char16_t* utf16, int len) {
@@ -89,9 +89,8 @@ std::string utf16_to_utf8(const char16_t* utf16, int len) {
     return utf8;
 }
 
-// ===== 【新增：自动化字典读取搬运工】 =====
+// ===== 【自动化字典读取搬运工】 =====
 void load_translation_dict() {
-    // 路径完全匹配你在 MT 管理器中确认的黄金路径
     std::string path = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/string_data.txt";
     std::ifstream file(path);
     
@@ -103,13 +102,11 @@ void load_translation_dict() {
     std::string line;
     int count = 0;
     while (std::getline(file, line)) {
-        // 自动干掉 Windows 换行带来的末尾回车符（\r），防止匹配失效
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
         if (line.empty()) continue;
 
-        // 根据 = 号切分韩文和中文
         size_t pos = line.find('=');
         if (pos != std::string::npos) {
             std::string kr = line.substr(0, pos);
@@ -125,33 +122,26 @@ void load_translation_dict() {
 
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
-// ===== 【升级：智能查表拦截器】 =====
+// ===== 【智能查表拦截器】 =====
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
-        // 转换出真实的原文内容
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         
-        // 前往内存字典搜寻这行韩文
         auto it = translation_map.find(original_text);
         if (it != translation_map.end()) {
-            // 抓到了！直接打印汉化匹配成功日志
             LOGI("【汉化匹配】成功替换: %s -> %s", original_text.c_str(), it->second.c_str());
             
-            // 呼叫 Unity 引擎底层造字函数，在内存中临时凭空创造一个中文游戏文本对象
-            if (il2cpp_string_new != nullptr) {
-                MyIl2CppString* new_string = il2cpp_string_new(it->second.c_str());
+            // 使用我们更名后的私有造字指针
+            if (il2cpp_string_new_ptr != nullptr) {
+                MyIl2CppString* new_string = il2cpp_string_new_ptr(it->second.c_str());
                 if (new_string != nullptr) {
-                    // 把新造的中文指针喂给游戏，实现偷梁换柱
                     return old_set_text(__this, new_string);
                 }
             }
         } else {
-            // 没在字典里的，依然维持纯正中文提示的单行输出，方便你捕获复制
             LOGI("【文本捕获】字数: %d | 内容: %s", il2cpp_string->length, original_text.c_str());
         }
     }
-    
-    // 如果没找到翻译，原样放行，确保游戏绝对不崩溃
     old_set_text(__this, il2cpp_string);
 }
 
@@ -163,16 +153,14 @@ void hack_start(const char *game_data_dir) {
             hook_exit_functions();
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
             if (il2cpp_base != 0) {
-                // ===== 【新增：在 Hook 前夕绑定造字函数并加载外部字典】 =====
                 void* il2cpp_handle = dlopen("libil2cpp.so", RTLD_LAZY);
                 if (il2cpp_handle != nullptr) {
-                    il2cpp_string_new = (MyIl2CppString* (*)(const char*))dlsym(il2cpp_handle, "il2cpp_string_new");
+                    // 同样将获取到的函数句柄赋值给更名后的私有指针
+                    il2cpp_string_new_ptr = (MyIl2CppString* (*)(const char*))dlsym(il2cpp_handle, "il2cpp_string_new");
                 }
                 
-                // 运行搬运工，把刚才外挂的 txt 加载到内存对照表
                 load_translation_dict();
 
-                // 使用最新提取验证的有效 RVA 偏移地址
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5157f0);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("【成功】TextMeshPro::set_text 挂钩完成");
