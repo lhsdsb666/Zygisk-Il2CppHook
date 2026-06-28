@@ -88,7 +88,7 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
         
         // 【优化】：极致精简的单行输出，去掉了爆炸特效，一眼就能看清文本，极方便复制
-        LOGI("[Text Capture] Len: %d | Content: %s", il2cpp_string->length, original_text.c_str());
+        LOGI("【文本捕获】字数: %d | 内容: %s", il2cpp_string->length, original_text.c_str());
     }
     
     // 纯洁放行，不修改任何内存，确保游戏和后续日志都能看到正常的韩文原文
