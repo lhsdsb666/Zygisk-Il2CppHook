@@ -18,7 +18,7 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
-#include <unordered_set>
+#include <unordered_set>   // ★新增
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
@@ -66,7 +66,7 @@ struct MyIl2CppString {
 };
 
 std::unordered_map<std::string, std::string> translation_map;
-std::unordered_set<std::string> captured_kr_texts; // 已捕获文本去重集合
+std::unordered_set<std::string> captured_kr_texts;  // ★新增：去重集合
 static MyIl2CppString* (*il2cpp_string_new_ptr)(const char* str) = nullptr;
 
 std::string utf16_to_utf8(const char16_t* utf16, int len) {
@@ -87,7 +87,7 @@ std::string utf16_to_utf8(const char16_t* utf16, int len) {
     return utf8;
 }
 
-// 检查字符串是否含韩文
+// ★新增：检查是否含韩文
 bool contains_korean(const char16_t* chars, int len) {
     for (int i = 0; i < len; i++) {
         char16_t c = chars[i];
@@ -125,13 +125,12 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
 
-        // ===== 韩文捕获：含韩文且未记录过，追加写入文件 =====
+        // ★新增：含韩文且未记录过，追加写入文件
         if (contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
             if (captured_kr_texts.find(original_text) == captured_kr_texts.end()) {
                 captured_kr_texts.insert(original_text);
                 FILE* f = fopen("/sdcard/Download/captured_korean.txt", "a");
                 if (f != nullptr) {
-                    // 把文本内的换行替换为字面量 \n，保证每条一行
                     std::string safe = original_text;
                     size_t p = 0;
                     while ((p = safe.find('\n', p)) != std::string::npos) {
@@ -140,19 +139,24 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
                     fprintf(f, "%s\n", safe.c_str());
                     fclose(f);
                 }
-                LOGI("【文本捕获】%s", original_text.c_str());
             }
         }
-        // ===== 汉化替换 =====
+
         auto it = translation_map.find(original_text);
         if (it != translation_map.end()) {
             if (il2cpp_string_new_ptr != nullptr) {
                 MyIl2CppString* new_string = il2cpp_string_new_ptr(it->second.c_str());
                 if (new_string != nullptr) {
-                    LOGI("【汉化匹配】%s -> %s", original_text.c_str(), it->second.c_str());
+                    LOGI("【汉化匹配】成功替换: %s -> %s", original_text.c_str(), it->second.c_str());
                     return old_set_text(__this, new_string);
+                } else {
+                    LOGI("【汉化错误】il2cpp_string_new 内存分配失败：%s", it->second.c_str());
                 }
+            } else {
+                LOGI("【汉化错误】无法替换！il2cpp_string_new 符号指针为空！");
             }
+        } else {
+            LOGI("【文本捕获】字数: %d | 内容: %s", il2cpp_string->length, original_text.c_str());
         }
     }
     old_set_text(__this, il2cpp_string);
@@ -173,11 +177,13 @@ void hack_start(const char *game_data_dir) {
                 } else {
                     LOGI("【严重错误】未能通过 xdl 找到 il2cpp_string_new 符号！");
                 }
+
                 load_translation_dict();
 
-                void* set_text_addr = (void*)(il2cpp_base + 0xb5157f0);
+                void* set_text_addr = (void*)(il2cpp_base + 0xb670210);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("【成功】TextMeshPro::set_text 挂钩完成");
+                // deod hook 已移除，不再尝试 hook 解密函数，避免黑屏崩溃
             }
             break;
         }
