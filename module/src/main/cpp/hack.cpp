@@ -132,58 +132,67 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     old_set_text(__this, il2cpp_string);
 }
 
-// ==================== deod 解密捕获 ====================
-// 捕获 gsm.deod(Byte[] a, Int32 b) 解密后的明文
-// 作用：拿到 kr.client 的解密内容，写入 /sdcard/Download/decrypted_kr.bin
-// 只需运行一次，拿到文件后可关闭此功能
+// ==================== 新版 deod 解密捕获 ====================
+// 目标函数签名已修正为: public static Byte[] deod(gnx a)
+// 此时 deod 是静态函数，执行后直接返回包含明文/密文数据的 Byte[] 数组指针
 
 static bool deod_dumped = false;
-static int32_t (*old_deod)(void* thisptr, void* arr, int32_t b) = nullptr;
+static void* (*old_deod)(void* gnx_a, void* method_info) = nullptr;
 
-// kr.client 加密内容的固定头部签名（前16字节，两个版本完全一致，确认身份用）
+// kr.client 加密内容的固定头部签名
 static const uint8_t KR_CLIENT_SIG[16] = {
     0x66,0x51,0xde,0x9f,0x0b,0xd4,0x25,0x06,
     0x7d,0xd6,0x01,0x16,0x20,0xcf,0xf4,0xd5
 };
 
-int32_t my_deod(void* thisptr, void* arr, int32_t b) {
-    // 解密前：arr 里是密文，检查是否是 kr.client
-    bool is_kr_client = false;
-    uint64_t arr_len = 0;
-    uint8_t* arr_data = nullptr;
+void* my_deod(void* gnx_a, void* method_info) {
+    // 先调用原始函数，获取它返回的 Byte[] 数组指针
+    void* arr = old_deod(gnx_a, method_info);
 
     if (arr != nullptr) {
-        // Il2CppArray 结构（64位）:
-        //   +0x00 klass*, +0x08 monitor*, +0x10 bounds*
-        //   +0x18 max_length (uint64), +0x20 data[]
-        arr_len  = *(uint64_t*)((uint8_t*)arr + 0x18);
-        arr_data = (uint8_t*)arr + 0x20;
+        // 解析 Il2CppArray 结构获取长度与数据首地址
+        uint64_t arr_len  = *(uint64_t*)((uint8_t*)arr + 0x18);
+        uint8_t* arr_data = (uint8_t*)arr + 0x20;
 
-        if (arr_len >= 16) {
-            is_kr_client = (memcmp(arr_data, KR_CLIENT_SIG, 16) == 0);
+        if (arr_len > 0 && arr_data != nullptr) {
+            // 1. 提取前 16 字节打印到日志，方便在 Logcat 中肉眼观察数据特征
+            char hex_str[64] = {0};
+            for (int i = 0; i < (arr_len < 16 ? arr_len : 16); i++) {
+                sprintf(hex_str + strlen(hex_str), "%02X ", arr_data[i]);
+            }
+            LOGI("【deod拦截】函数调用成功 | 返回数组长度=%lu | 前16字节Hex: %s", (unsigned long)arr_len, hex_str);
+
+            // 2. 特征匹配判定
+            bool is_encrypted_kr = (arr_len >= 16 && memcmp(arr_data, KR_CLIENT_SIG, 16) == 0);
+            
+            static const uint8_t UNITYFS_SIG[7] = {0x55, 0x6E, 0x69, 0x74, 0x79, 0x46, 0x53}; // "UnityFS"
+            bool is_unity_fs = (arr_len >= 7 && memcmp(arr_data, UNITYFS_SIG, 7) == 0);
+
+            // 3. 触发转存：如果是 kr 密文、或者是解密后的 UnityFS 资产、或者文件大于 500KB，统统捞出来
+            if (is_unity_fs || is_encrypted_kr || arr_len > 500000) {
+                char out_path[128];
+                if (is_unity_fs) {
+                    snprintf(out_path, sizeof(out_path), "/sdcard/Download/decrypted_unityfs_%lu.bin", (unsigned long)arr_len);
+                } else if (is_encrypted_kr) {
+                    snprintf(out_path, sizeof(out_path), "/sdcard/Download/encrypted_kr_%lu.bin", (unsigned long)arr_len);
+                } else {
+                    snprintf(out_path, sizeof(out_path), "/sdcard/Download/dumped_asset_%lu.bin", (unsigned long)arr_len);
+                }
+
+                FILE* f = fopen(out_path, "wb");
+                if (f != nullptr) {
+                    size_t written = fwrite(arr_data, 1, (size_t)arr_len, f);
+                    fclose(f);
+                    deod_dumped = true;
+                    LOGI("【解密Dump】成功捕获目标！已保存 %zu 字节到 %s", written, out_path);
+                } else {
+                    LOGI("【解密Dump】写文件失败！请检查外置存储写入权限。路径：%s", out_path);
+                }
+            }
         }
-        LOGI("【deod】调用 | 数组长度=%lu | b=%d | kr.client=%d",
-             (unsigned long)arr_len, b, (int)is_kr_client);
     }
 
-    // 调用原始解密函数
-    int32_t result = old_deod(thisptr, arr, b);
-
-    // 解密后：arr 里是明文，如果是 kr.client 就保存
-    if (is_kr_client && !deod_dumped && arr_data != nullptr && arr_len > 0) {
-        const char* out_path = "/sdcard/Download/decrypted_kr.bin";
-        FILE* f = fopen(out_path, "wb");
-        if (f != nullptr) {
-            size_t written = fwrite(arr_data, 1, (size_t)arr_len, f);
-            fclose(f);
-            deod_dumped = true;
-            LOGI("【解密Dump】成功！已保存 %zu 字节到 %s", written, out_path);
-        } else {
-            LOGI("【解密Dump】写文件失败！路径：%s", out_path);
-        }
-    }
-
-    return result;
+    return arr;
 }
 
 // ==================== 主入口 ====================
@@ -210,11 +219,11 @@ void hack_start(const char *game_data_dir) {
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("【成功】TextMeshPro::set_text 挂钩完成");
 
-                // Hook gsm.deod（捕获 kr.client 解密明文）
+                // Hook qpu.deod（当前版本 dump.cs 确证的真实解密出口）
                 // 已经替换为最新 RVA 地址: 0x5edf60c
                 void* deod_addr = (void*)(il2cpp_base + 0x5edf60c);
                 DobbyHook(deod_addr, (void*)my_deod, (void**)&old_deod);
-                LOGI("【成功】gsm::deod 解密捕获 Hook 已安装，等待 kr.client 解密...");
+                LOGI("【成功】qpu::deod 解密捕获 Hook 已安装，真实偏移 0x5edf60c，等待资产加载...");
             }
             break;
         }
