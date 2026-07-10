@@ -13,10 +13,8 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
-#include <cstdint> 
-#include <string>  
-
-// ===== 【汉化方案A所需工具箱】 =====
+#include <cstdint>
+#include <string>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -63,14 +61,12 @@ struct MyIl2CppString {
     void* klass;
     void* monitor;
     int32_t length;
-    char16_t chars[0]; 
+    char16_t chars[0];
 };
 
-// ===== 【全局汉化字典与私有化造字函数指针】 =====
 std::unordered_map<std::string, std::string> translation_map;
 static MyIl2CppString* (*il2cpp_string_new_ptr)(const char* str) = nullptr;
 
-// UTF-16 转 UTF-8
 std::string utf16_to_utf8(const char16_t* utf16, int len) {
     std::string utf8;
     for (int i = 0; i < len; ++i) {
@@ -89,30 +85,21 @@ std::string utf16_to_utf8(const char16_t* utf16, int len) {
     return utf8;
 }
 
-// ===== 【自动化字典读取搬运工】 =====
 void load_translation_dict() {
     std::string path = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/string_data.txt";
     std::ifstream file(path);
-    
     if (!file.is_open()) {
         LOGI("【汉化提示】未能打开字典文件，请检查路径或权限！");
         return;
     }
-
     std::string line;
     int count = 0;
     while (std::getline(file, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
-
         size_t pos = line.find('=');
         if (pos != std::string::npos) {
-            std::string kr = line.substr(0, pos);
-            std::string cn = line.substr(pos + 1);
-            
-            translation_map[kr] = cn;
+            translation_map[line.substr(0, pos)] = line.substr(pos + 1);
             count++;
         }
     }
@@ -122,14 +109,11 @@ void load_translation_dict() {
 
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
-// ===== 【智能查表拦截器】 =====
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
-        
         auto it = translation_map.find(original_text);
         if (it != translation_map.end()) {
-            // 确保造字指针有效才算真正替换成功
             if (il2cpp_string_new_ptr != nullptr) {
                 MyIl2CppString* new_string = il2cpp_string_new_ptr(it->second.c_str());
                 if (new_string != nullptr) {
@@ -148,6 +132,61 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     old_set_text(__this, il2cpp_string);
 }
 
+// ==================== deod 解密捕获 ====================
+// 捕获 gsm.deod(Byte[] a, Int32 b) 解密后的明文
+// RVA: 0x5ef5cd0 | 作用：拿到 kr.client 的解密内容，写入 /sdcard/Download/decrypted_kr.bin
+// 只需运行一次，拿到文件后可关闭此功能
+
+static bool deod_dumped = false;
+static int32_t (*old_deod)(void* thisptr, void* arr, int32_t b) = nullptr;
+
+// kr.client 加密内容的固定头部签名（前16字节，两个版本完全一致，确认身份用）
+static const uint8_t KR_CLIENT_SIG[16] = {
+    0x66,0x51,0xde,0x9f,0x0b,0xd4,0x25,0x06,
+    0x7d,0xd6,0x01,0x16,0x20,0xcf,0xf4,0xd5
+};
+
+int32_t my_deod(void* thisptr, void* arr, int32_t b) {
+    // 解密前：arr 里是密文，检查是否是 kr.client
+    bool is_kr_client = false;
+    uint64_t arr_len = 0;
+    uint8_t* arr_data = nullptr;
+
+    if (arr != nullptr) {
+        // Il2CppArray 结构（64位）:
+        //   +0x00 klass*, +0x08 monitor*, +0x10 bounds*
+        //   +0x18 max_length (uint64), +0x20 data[]
+        arr_len  = *(uint64_t*)((uint8_t*)arr + 0x18);
+        arr_data = (uint8_t*)arr + 0x20;
+
+        if (arr_len >= 16) {
+            is_kr_client = (memcmp(arr_data, KR_CLIENT_SIG, 16) == 0);
+        }
+        LOGI("【deod】调用 | 数组长度=%lu | b=%d | kr.client=%d",
+             (unsigned long)arr_len, b, (int)is_kr_client);
+    }
+
+    // 调用原始解密函数
+    int32_t result = old_deod(thisptr, arr, b);
+
+    // 解密后：arr 里是明文，如果是 kr.client 就保存
+    if (is_kr_client && !deod_dumped && arr_data != nullptr && arr_len > 0) {
+        const char* out_path = "/sdcard/Download/decrypted_kr.bin";
+        FILE* f = fopen(out_path, "wb");
+        if (f != nullptr) {
+            size_t written = fwrite(arr_data, 1, (size_t)arr_len, f);
+            fclose(f);
+            deod_dumped = true;
+            LOGI("【解密Dump】成功！已保存 %zu 字节到 %s", written, out_path);
+        } else {
+            LOGI("【解密Dump】写文件失败！路径：%s", out_path);
+        }
+    }
+
+    return result;
+}
+
+// ==================== 主入口 ====================
 void hack_start(const char *game_data_dir) {
     LOGI("hack_start inside, waiting for libil2cpp.so...");
     for (int i = 0; i < 300; i++) {
@@ -156,20 +195,24 @@ void hack_start(const char *game_data_dir) {
             hook_exit_functions();
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
             if (il2cpp_base != 0) {
-                // 【核心修正】：直接使用已经成功打开的高级 xdl 句柄来寻找符号，拒绝不稳定的原生 dlopen
                 il2cpp_string_new_ptr = (MyIl2CppString* (*)(const char*))xdl_sym(handle, "il2cpp_string_new", nullptr);
-                
                 if (il2cpp_string_new_ptr != nullptr) {
                     LOGI("【成功】成功通过 xdl 绑定 il2cpp_string_new，地址：%p", il2cpp_string_new_ptr);
                 } else {
                     LOGI("【严重错误】未能通过 xdl 找到 il2cpp_string_new 符号！");
                 }
-                
+
                 load_translation_dict();
 
+                // Hook TextMeshPro set_text（原有汉化功能）
                 void* set_text_addr = (void*)(il2cpp_base + 0xb5157f0);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("【成功】TextMeshPro::set_text 挂钩完成");
+
+                // Hook gsm.deod（捕获 kr.client 解密明文）
+                void* deod_addr = (void*)(il2cpp_base + 0x5ef5cd0);
+                DobbyHook(deod_addr, (void*)my_deod, (void**)&old_deod);
+                LOGI("【成功】gsm::deod 解密捕获 Hook 已安装，等待 kr.client 解密...");
             }
             break;
         }
@@ -177,7 +220,7 @@ void hack_start(const char *game_data_dir) {
     }
 }
 
-// ==================== 以下为模拟器环境兼容代码 ====================
+// ==================== 模拟器环境兼容代码 ====================
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr; vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
