@@ -134,7 +134,7 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
 
 // ==================== deod 解密捕获 ====================
 // 捕获 gsm.deod(Byte[] a, Int32 b) 解密后的明文
-// RVA: 0x5ef5cd0 | 作用：拿到 kr.client 的解密内容，写入 /sdcard/Download/decrypted_kr.bin
+// 作用：拿到 kr.client 的解密内容，写入 /sdcard/Download/decrypted_kr.bin
 // 只需运行一次，拿到文件后可关闭此功能
 
 static bool deod_dumped = false;
@@ -205,12 +205,14 @@ void hack_start(const char *game_data_dir) {
                 load_translation_dict();
 
                 // Hook TextMeshPro set_text（原有汉化功能）
-                void* set_text_addr = (void*)(il2cpp_base + 0xb5157f0);
+                // 已经替换为最新 RVA 地址: 0xb670210
+                void* set_text_addr = (void*)(il2cpp_base + 0xb670210);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("【成功】TextMeshPro::set_text 挂钩完成");
 
                 // Hook gsm.deod（捕获 kr.client 解密明文）
-                void* deod_addr = (void*)(il2cpp_base + 0x5ef5cd0);
+                // 已经替换为最新 RVA 地址: 0x5edf60c
+                void* deod_addr = (void*)(il2cpp_base + 0x5edf60c);
                 DobbyHook(deod_addr, (void*)my_deod, (void**)&old_deod);
                 LOGI("【成功】gsm::deod 解密捕获 Hook 已安装，等待 kr.client 解密...");
             }
