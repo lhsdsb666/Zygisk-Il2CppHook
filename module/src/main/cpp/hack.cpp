@@ -123,7 +123,6 @@ static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullp
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
-
         if (contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
             if (captured_kr_texts.find(original_text) == captured_kr_texts.end()) {
                 captured_kr_texts.insert(original_text);
@@ -131,15 +130,12 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
                 if (f != nullptr) {
                     std::string safe = original_text;
                     size_t p = 0;
-                    while ((p = safe.find('\n', p)) != std::string::npos) {
-                        safe.replace(p, 1, "\\n"); p += 2;
-                    }
+                    while ((p = safe.find('\n', p)) != std::string::npos) { safe.replace(p, 1, "\\n"); p += 2; }
                     fprintf(f, "%s\n", safe.c_str());
                     fclose(f);
                 }
             }
         }
-
         auto it = translation_map.find(original_text);
         if (it != translation_map.end()) {
             if (il2cpp_string_new_ptr != nullptr) {
@@ -147,11 +143,7 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
                 if (new_string != nullptr) {
                     LOGI("【汉化匹配】成功替换: %s -> %s", original_text.c_str(), it->second.c_str());
                     return old_set_text(__this, new_string);
-                } else {
-                    LOGI("【汉化错误】il2cpp_string_new 内存分配失败：%s", it->second.c_str());
                 }
-            } else {
-                LOGI("【汉化错误】无法替换！il2cpp_string_new 符号指针为空！");
             }
         } else {
             LOGI("【文本捕获】字数: %d | 内容: %s", il2cpp_string->length, original_text.c_str());
@@ -160,99 +152,59 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     old_set_text(__this, il2cpp_string);
 }
 
-// ==================== gsm 构造函数 Hook（捕获加密密钥）====================
-//
-// 目标：gsm.ctor(Byte[] a, Byte[] b, Int32 c)  RVA: 0x5f2de0c
-//
-// 原理：
-//   gsm 是负责 kr.client 加解密的类。
-//   它的构造函数直接接收两个 Byte[] 参数 a 和 b，
-//   这两个字节数组就是加密用的密钥和 IV（初始向量）。
-//   我们只需要在构造函数被调用时，把 a 和 b 的内容
-//   原样保存到文件，就得到了密钥。
-//
-// 输出文件：
-//   /sdcard/Download/gsm_key_a.bin  ← 密钥 A（参数 a）
-//   /sdcard/Download/gsm_key_b.bin  ← 密钥 B（参数 b）
-//   /sdcard/Download/gsm_keys.txt   ← 两个密钥的 hex 文本，方便查看
+// ==================== qpu.deod 返回值捕获 ====================
+// 目标：public static Byte[] deod(gnx a)
+// RVA: 0x5edf6c4
+// 这是静态方法，直接返回 Byte[]
+// 我们拦截每一次返回值，把所有大于 100KB 的数组存下来
+// 进游戏等加载完成后，/sdcard/Download/ 里的 deod_*.bin 就是候选明文
 
-static bool gsm_key_dumped = false;
-static void (*old_gsm_ctor)(void* thisptr, void* arr_a, void* arr_b, int32_t c) = nullptr;
+static int deod_call_count = 0;
+static void* (*old_qpu_deod)(void* gnx_a) = nullptr;
 
-// 把 Il2CppArray 内容写到文件，同时返回 hex 字符串用于日志
-std::string dump_il2cpp_array(const char* label, void* arr, const char* bin_path) {
-    std::string hex_result = "(null)";
+void* my_qpu_deod(void* gnx_a) {
+    // 调用原始函数，拿到返回的 Byte[]
+    void* result = old_qpu_deod(gnx_a);
 
-    if (arr == nullptr) {
-        LOGI("【密钥捕获】%s = null，跳过", label);
-        return hex_result;
+    deod_call_count++;
+
+    if (result == nullptr) {
+        LOGI("【deod #%d】返回 null，跳过", deod_call_count);
+        return result;
     }
 
-    // Il2CppArray 内存布局（64位）：
-    //   +0x00  klass*        (8字节)
-    //   +0x08  monitor*      (8字节)
-    //   +0x10  bounds*       (8字节，一维数组为 null)
-    //   +0x18  max_length    (uint64，数组元素个数)
-    //   +0x20  data[]        (实际字节数据从这里开始)
-    uint64_t len  = *(uint64_t*)((uint8_t*)arr + 0x18);
-    uint8_t* data = (uint8_t*)arr + 0x20;
+    // 解析 Il2CppArray
+    // +0x18 = max_length (uint64)
+    // +0x20 = data 起始
+    uint64_t len  = *(uint64_t*)((uint8_t*)result + 0x18);
+    uint8_t* data = (uint8_t*)result + 0x20;
 
-    if (len == 0 || len > 4096) {
-        // 密钥一般不会超过 4KB，超出则说明地址有误
-        LOGI("【密钥捕获】%s 长度异常: %lu，跳过", label, (unsigned long)len);
-        return hex_result;
-    }
+    // 前8字节 hex，方便日志判断内容
+    char preview[32] = {0};
+    uint64_t preview_len = len < 8 ? len : 8;
+    for (uint64_t i = 0; i < preview_len; i++)
+        snprintf(preview + i*3, 4, "%02X ", data[i]);
 
-    // 写二进制文件
-    FILE* fb = fopen(bin_path, "wb");
-    if (fb != nullptr) {
-        fwrite(data, 1, (size_t)len, fb);
-        fclose(fb);
-        LOGI("【密钥捕获】%s 已写入 %s（%lu 字节）", label, bin_path, (unsigned long)len);
-    } else {
-        LOGI("【密钥捕获】%s 写文件失败: %s", label, bin_path);
-    }
+    LOGI("【deod #%d】返回数组长度=%lu | 头8字节: %s",
+         deod_call_count, (unsigned long)len, preview);
 
-    // 生成 hex 字符串（用于日志和文本文件）
-    hex_result.clear();
-    char buf[4];
-    for (uint64_t i = 0; i < len; i++) {
-        snprintf(buf, sizeof(buf), "%02X", data[i]);
-        hex_result += buf;
-        if (i < len - 1) hex_result += " ";
-    }
-
-    return hex_result;
-}
-
-void my_gsm_ctor(void* thisptr, void* arr_a, void* arr_b, int32_t c) {
-    // 先调用原始构造函数，保证游戏逻辑不受影响
-    old_gsm_ctor(thisptr, arr_a, arr_b, c);
-
-    // 只捕获一次（构造函数可能被多次调用，只要第一次即可）
-    if (!gsm_key_dumped) {
-        gsm_key_dumped = true;
-        LOGI("【密钥捕获】gsm 构造函数触发！thisptr=%p  arr_a=%p  arr_b=%p  c=%d",
-             thisptr, arr_a, arr_b, c);
-
-        std::string hex_a = dump_il2cpp_array("密钥A", arr_a, "/sdcard/Download/gsm_key_a.bin");
-        std::string hex_b = dump_il2cpp_array("密钥B", arr_b, "/sdcard/Download/gsm_key_b.bin");
-
-        // 额外写一个可读的文本文件，方便直接查看
-        FILE* ft = fopen("/sdcard/Download/gsm_keys.txt", "w");
-        if (ft != nullptr) {
-            fprintf(ft, "key_a_hex=%s\n", hex_a.c_str());
-            fprintf(ft, "key_b_hex=%s\n", hex_b.c_str());
-            fprintf(ft, "param_c=%d\n", c);
-            fclose(ft);
+    // 只保存大于 100KB 的，太小的跳过（避免写大量垃圾文件）
+    if (len > 100000) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sdcard/Download/deod_%d_%lu.bin",
+                 deod_call_count, (unsigned long)len);
+        FILE* f = fopen(path, "wb");
+        if (f != nullptr) {
+            fwrite(data, 1, (size_t)len, f);
+            fclose(f);
+            LOGI("【deod #%d】已保存到 %s", deod_call_count, path);
+        } else {
+            LOGI("【deod #%d】写文件失败: %s", deod_call_count, path);
         }
-
-        LOGI("【密钥捕获】完成！");
-        LOGI("【密钥捕获】key_a = %s", hex_a.c_str());
-        LOGI("【密钥捕获】key_b = %s", hex_b.c_str());
-        LOGI("【密钥捕获】param_c = %d", c);
-        LOGI("【密钥捕获】三个文件已保存到 /sdcard/Download/");
     }
+
+    return result;
 }
 
 // ==================== 主入口 ====================
@@ -278,12 +230,11 @@ void hack_start(const char *game_data_dir) {
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
                 LOGI("【成功】TextMeshPro::set_text 挂钩完成");
 
-                // Hook 2：gsm 构造函数，捕获 kr.client 加密密钥
-                // class gsm : glm，.ctor(Byte[] a, Byte[] b, Int32 c)
-                // RVA: 0x5f2de0c
-                void* gsm_ctor_addr = (void*)(il2cpp_base + 0x5f2de0c);
-                DobbyHook(gsm_ctor_addr, (void*)my_gsm_ctor, (void**)&old_gsm_ctor);
-                LOGI("【成功】gsm 构造函数 Hook 已安装（RVA: 0x5f2de0c），等待密钥出现...");
+                // Hook 2：qpu.deod 返回值捕获
+                // public static Byte[] deod(gnx a)  RVA: 0x5edf6c4
+                void* deod_addr = (void*)(il2cpp_base + 0x5edf6c4);
+                DobbyHook(deod_addr, (void*)my_qpu_deod, (void**)&old_qpu_deod);
+                LOGI("【成功】qpu.deod Hook 已安装（RVA: 0x5edf6c4），等待返回值...");
             }
             break;
         }
