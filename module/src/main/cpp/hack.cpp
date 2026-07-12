@@ -149,7 +149,7 @@ void scan_memory_for_korean() {
         size_t size = end - start;
 
         // 只扫 256KB ~ 80MB 的区域
-        if (size < 256 * 1024 || size > 80 * 1024 * 1024) continue;
+        if (size < 32 * 1024 || size > 80 * 1024 * 1024) continue;
 
         // 跳过系统库
         if (pathname[0] != '\0') {
@@ -188,7 +188,7 @@ void scan_memory_for_korean() {
              pathname[0] ? pathname : "匿名堆");
 
         // 密度 > 1.5/KB 且总数 > 100，保存
-        if (density > 1.5f && kr_count > 100) {
+        if (kr_count > 30) {
             char out[128];
             snprintf(out, sizeof(out), "/sdcard/Download/memdump_%d_%zuKB.bin", ++saved, size / 1024);
             FILE* f = fopen(out, "wb");
