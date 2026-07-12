@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdlib>
+#include <sys/uio.h>
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
@@ -100,121 +101,101 @@ bool contains_korean(const char16_t* chars, int len) {
 void load_translation_dict() {
     std::string path = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/string_data.txt";
     std::ifstream file(path);
-    if (!file.is_open()) {
-        LOGI("【汉化提示】未能打开字典文件！");
-        return;
-    }
-    std::string line;
-    int count = 0;
+    if (!file.is_open()) { LOGI("【汉化提示】未能打开字典文件！"); return; }
+    std::string line; int count = 0;
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
         size_t pos = line.find('=');
-        if (pos != std::string::npos) {
-            translation_map[line.substr(0, pos)] = line.substr(pos + 1);
-            count++;
-        }
+        if (pos != std::string::npos) { translation_map[line.substr(0, pos)] = line.substr(pos + 1); count++; }
     }
     file.close();
     LOGI("【汉化提示】字典加载成功！共读入 %d 条翻译词条。", count);
 }
 
-// ==================== 内存扫描：找韩文明文 ====================
-//
-// 目的：set_text 第一次收到韩文时，解密已经完成了，数据就在内存里。
-// 做法：扫描 /proc/self/maps 列出的所有可读内存区域，
-//       用 /proc/self/mem 读取内容，统计每块区域的韩文 UTF-8 字符密度，
-//       把韩文密度高的区域整块保存下来。
-// 结果：/sdcard/Download/memdump_N_XXXkb.bin
-//       把这些文件发给 Claude，他来找出 kr.client 的明文。
+// ==================== 内存扫描：直接指针读取 ====================
+// 修正版：上一版错误地用 /proc/self/mem（Android 不让读）。
+// 正确做法：我们的代码本身就跑在游戏进程里，
+// 直接把地址转成指针读就行，完全不需要打开任何文件。
+// 用 process_vm_readv 逐块安全读取，读失败就跳过，不会崩溃。
 
 static bool memory_scan_done = false;
 
 void scan_memory_for_korean() {
-    LOGI("【内存扫描】开始，遍历 /proc/self/maps ...");
+    LOGI("【内存扫描】启动（直接指针读取版）...");
 
     FILE* maps = fopen("/proc/self/maps", "r");
-    FILE* mem_f = fopen("/proc/self/mem", "rb");
-    if (!maps || !mem_f) {
-        LOGI("【内存扫描】无法打开内存文件，放弃");
-        if (maps) fclose(maps);
-        if (mem_f) fclose(mem_f);
-        return;
-    }
+    if (!maps) { LOGI("【内存扫描】无法打开 maps，放弃"); return; }
 
     char line[512];
     int saved = 0;
+    pid_t pid = getpid();
 
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start = 0, end = 0;
         char perms[8] = {0};
         char pathname[256] = {0};
 
-        // 解析 maps 行：start-end perms offset dev inode [pathname]
         sscanf(line, "%lx-%lx %4s", &start, &end, perms);
 
-        // 提取路径（最后一个空格后的内容）
-        char* last_space = strrchr(line, ' ');
-        if (last_space && last_space[1] != '\n' && last_space[1] != '\0') {
-            strncpy(pathname, last_space + 1, sizeof(pathname) - 1);
-            char* nl = strchr(pathname, '\n');
-            if (nl) *nl = '\0';
+        // 提取路径
+        char* sp = strrchr(line, ' ');
+        if (sp && sp[1] != '\n' && sp[1] != '\0') {
+            strncpy(pathname, sp + 1, sizeof(pathname) - 1);
+            char* nl = strchr(pathname, '\n'); if (nl) *nl = '\0';
         }
 
-        // 只扫描可读区域
         if (perms[0] != 'r') continue;
-
         size_t size = end - start;
 
-        // 跳过太小（<256KB）或太大（>80MB）的区域
+        // 只扫 256KB ~ 80MB 的区域
         if (size < 256 * 1024 || size > 80 * 1024 * 1024) continue;
 
-        // 跳过系统库映射：.so / .apk / /dev / [vdso] 等
+        // 跳过系统库
         if (pathname[0] != '\0') {
             if (strstr(pathname, ".so") || strstr(pathname, ".apk") ||
                 strstr(pathname, "/dev/") || strstr(pathname, "[vdso]") ||
-                strstr(pathname, "[vsyscall]") || strstr(pathname, "dalvik-jit") ||
-                strstr(pathname, "gralloc") || strstr(pathname, "ashmem"))
+                strstr(pathname, "[vsyscall]") || strstr(pathname, "dalvik-jit"))
                 continue;
         }
 
-        // 读取内存块
+        // 用 process_vm_readv 安全读取（失败直接跳过，不崩溃）
         uint8_t* buf = (uint8_t*)malloc(size);
         if (!buf) continue;
 
-        if (fseek(mem_f, (long)start, SEEK_SET) != 0) { free(buf); continue; }
-        size_t read_n = fread(buf, 1, size, mem_f);
-        if (read_n < 1024) { free(buf); continue; }
+        struct iovec local_iov  = { buf,          size };
+        struct iovec remote_iov = { (void*)start, size };
+        ssize_t nread = process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
 
-        // 统计韩文 UTF-8 三字节序列（EA-ED 80-BF 80-BF）
+        if (nread <= 0) { free(buf); continue; }
+        size_t read_n = (size_t)nread;
+
+        // 统计韩文 UTF-8 三字节序列（0xEA-0xED 开头）
         int kr_count = 0;
         for (size_t i = 0; i + 2 < read_n; i++) {
             if (buf[i] >= 0xEA && buf[i] <= 0xED &&
                 (buf[i+1] & 0xC0) == 0x80 &&
                 (buf[i+2] & 0xC0) == 0x80) {
                 kr_count++;
-                i += 2; // 跳过已匹配的字节
+                i += 2;
             }
         }
 
-        // 韩文密度：每 KB 有多少韩文字符
         float density = (float)kr_count / (read_n / 1024.0f);
 
         LOGI("【内存扫描】0x%08lx 大小=%zuKB 韩文=%d 密度=%.1f/KB [%s]",
              start, size / 1024, kr_count, density,
-             pathname[0] ? pathname : "匿名");
+             pathname[0] ? pathname : "匿名堆");
 
-        // 密度 > 每KB 1.5 个韩文字符 且总数 > 100，认为值得保存
+        // 密度 > 1.5/KB 且总数 > 100，保存
         if (density > 1.5f && kr_count > 100) {
             char out[128];
-            snprintf(out, sizeof(out),
-                     "/sdcard/Download/memdump_%d_%zuKB.bin",
-                     ++saved, size / 1024);
+            snprintf(out, sizeof(out), "/sdcard/Download/memdump_%d_%zuKB.bin", ++saved, size / 1024);
             FILE* f = fopen(out, "wb");
             if (f) {
                 fwrite(buf, 1, read_n, f);
                 fclose(f);
-                LOGI("【内存扫描】★ 保存 %s（%d 个韩文字，密度 %.1f/KB）", out, kr_count, density);
+                LOGI("【内存扫描】★ 已保存 %s（%d韩文字，%.1f/KB）", out, kr_count, density);
             } else {
                 LOGI("【内存扫描】写文件失败: %s", out);
             }
@@ -224,8 +205,7 @@ void scan_memory_for_korean() {
     }
 
     fclose(maps);
-    fclose(mem_f);
-    LOGI("【内存扫描】完成，共保存 %d 个区域到 /sdcard/Download/", saved);
+    LOGI("【内存扫描】完成，共保存 %d 个高密度区域", saved);
 }
 
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
@@ -235,22 +215,19 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
 
         if (contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
-            // 第一次捕获到韩文时，立即启动内存扫描（后台线程，不阻塞渲染）
             if (!memory_scan_done) {
                 memory_scan_done = true;
-                LOGI("【内存扫描】触发！第一条韩文出现，启动后台扫描...");
+                LOGI("【内存扫描】触发！启动后台扫描...");
                 std::thread(scan_memory_for_korean).detach();
             }
-
             if (captured_kr_texts.find(original_text) == captured_kr_texts.end()) {
                 captured_kr_texts.insert(original_text);
                 FILE* f = fopen("/sdcard/Download/captured_korean.txt", "a");
-                if (f != nullptr) {
+                if (f) {
                     std::string safe = original_text;
                     size_t p = 0;
                     while ((p = safe.find('\n', p)) != std::string::npos) { safe.replace(p, 1, "\\n"); p += 2; }
-                    fprintf(f, "%s\n", safe.c_str());
-                    fclose(f);
+                    fprintf(f, "%s\n", safe.c_str()); fclose(f);
                 }
             }
         }
@@ -281,11 +258,11 @@ void hack_start(const char *game_data_dir) {
             uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
             if (il2cpp_base != 0) {
                 il2cpp_string_new_ptr = (MyIl2CppString* (*)(const char*))xdl_sym(handle, "il2cpp_string_new", nullptr);
-                if (il2cpp_string_new_ptr != nullptr) {
-                    LOGI("【成功】il2cpp_string_new 绑定成功，地址：%p", il2cpp_string_new_ptr);
-                } else {
+                if (il2cpp_string_new_ptr != nullptr)
+                    LOGI("【成功】il2cpp_string_new 绑定成功 %p", il2cpp_string_new_ptr);
+                else
                     LOGI("【错误】未能找到 il2cpp_string_new！");
-                }
+
                 load_translation_dict();
 
                 void* set_text_addr = (void*)(il2cpp_base + 0xb670210);
