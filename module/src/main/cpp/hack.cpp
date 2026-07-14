@@ -20,7 +20,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdlib>
-#include <sys/uio.h>
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
@@ -113,113 +112,12 @@ void load_translation_dict() {
     LOGI("【汉化提示】字典加载成功！共读入 %d 条翻译词条。", count);
 }
 
-// ==================== 内存扫描：直接指针读取 ====================
-// 修正版：上一版错误地用 /proc/self/mem（Android 不让读）。
-// 正确做法：我们的代码本身就跑在游戏进程里，
-// 直接把地址转成指针读就行，完全不需要打开任何文件。
-// 用 process_vm_readv 逐块安全读取，读失败就跳过，不会崩溃。
-
-static bool memory_scan_done = false;
-
-void scan_memory_for_korean() {
-    LOGI("【内存扫描】启动（直接指针读取版）...");
-
-    FILE* maps = fopen("/proc/self/maps", "r");
-    if (!maps) { LOGI("【内存扫描】无法打开 maps，放弃"); return; }
-
-    char line[512];
-    int saved = 0;
-    pid_t pid = getpid();
-
-    while (fgets(line, sizeof(line), maps)) {
-        unsigned long start = 0, end = 0;
-        char perms[8] = {0};
-        char pathname[256] = {0};
-
-        sscanf(line, "%lx-%lx %4s", &start, &end, perms);
-
-        // 提取路径
-        char* sp = strrchr(line, ' ');
-        if (sp && sp[1] != '\n' && sp[1] != '\0') {
-            strncpy(pathname, sp + 1, sizeof(pathname) - 1);
-            char* nl = strchr(pathname, '\n'); if (nl) *nl = '\0';
-        }
-
-        if (perms[0] != 'r') continue;
-        size_t size = end - start;
-
-        // 只扫 256KB ~ 80MB 的区域
-        if (size < 32 * 1024 || size > 80 * 1024 * 1024) continue;
-
-        // 跳过系统库
-        if (pathname[0] != '\0') {
-            if (strstr(pathname, ".so") || strstr(pathname, ".apk") ||
-                strstr(pathname, "/dev/") || strstr(pathname, "[vdso]") ||
-                strstr(pathname, "[vsyscall]") || strstr(pathname, "dalvik-jit"))
-                continue;
-        }
-
-        // 用 process_vm_readv 安全读取（失败直接跳过，不崩溃）
-        uint8_t* buf = (uint8_t*)malloc(size);
-        if (!buf) continue;
-
-        struct iovec local_iov  = { buf,          size };
-        struct iovec remote_iov = { (void*)start, size };
-        ssize_t nread = process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
-
-        if (nread <= 0) { free(buf); continue; }
-        size_t read_n = (size_t)nread;
-
-        // 统计韩文 UTF-8 三字节序列（0xEA-0xED 开头）
-        int kr_count = 0;
-        for (size_t i = 0; i + 2 < read_n; i++) {
-            if (buf[i] >= 0xEA && buf[i] <= 0xED &&
-                (buf[i+1] & 0xC0) == 0x80 &&
-                (buf[i+2] & 0xC0) == 0x80) {
-                kr_count++;
-                i += 2;
-            }
-        }
-
-        float density = (float)kr_count / (read_n / 1024.0f);
-
-        LOGI("【内存扫描】0x%08lx 大小=%zuKB 韩文=%d 密度=%.1f/KB [%s]",
-             start, size / 1024, kr_count, density,
-             pathname[0] ? pathname : "匿名堆");
-
-        // 密度 > 1.5/KB 且总数 > 100，保存
-        if (kr_count > 30) {
-            char out[128];
-            snprintf(out, sizeof(out), "/sdcard/Download/memdump_%d_%zuKB.bin", ++saved, size / 1024);
-            FILE* f = fopen(out, "wb");
-            if (f) {
-                fwrite(buf, 1, read_n, f);
-                fclose(f);
-                LOGI("【内存扫描】★ 已保存 %s（%d韩文字，%.1f/KB）", out, kr_count, density);
-            } else {
-                LOGI("【内存扫描】写文件失败: %s", out);
-            }
-        }
-
-        free(buf);
-    }
-
-    fclose(maps);
-    LOGI("【内存扫描】完成，共保存 %d 个高密度区域", saved);
-}
-
 static void (*old_set_text)(void* __this, MyIl2CppString* il2cpp_string) = nullptr;
 
 void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     if (il2cpp_string != nullptr && il2cpp_string->length > 0) {
         std::string original_text = utf16_to_utf8(il2cpp_string->chars, il2cpp_string->length);
-
         if (contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
-            if (!memory_scan_done) {
-                memory_scan_done = true;
-                LOGI("【内存扫描】触发！启动后台扫描...");
-                std::thread(scan_memory_for_korean).detach();
-            }
             if (captured_kr_texts.find(original_text) == captured_kr_texts.end()) {
                 captured_kr_texts.insert(original_text);
                 FILE* f = fopen("/sdcard/Download/captured_korean.txt", "a");
@@ -231,7 +129,6 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
                 }
             }
         }
-
         auto it = translation_map.find(original_text);
         if (it != translation_map.end()) {
             if (il2cpp_string_new_ptr != nullptr) {
@@ -248,6 +145,86 @@ void my_set_text(void* __this, MyIl2CppString* il2cpp_string) {
     old_set_text(__this, il2cpp_string);
 }
 
+// ==================== 核心：拦截 MessagePack 明文 ====================
+//
+// 目标函数：public static gop deop(Byte[] a)   RVA: 0x5edfa94
+//
+// 逻辑：
+//   kr.client 解密完成后，游戏调用 deop() 把解密后的字节数组
+//   解析成 gop（游戏数据对象）。参数 a 就是完整的明文 MessagePack 数据。
+//   我们在它被解析之前把 a 的内容存到文件——这就是明文。
+//
+// 输出：/sdcard/Download/kr_plaintext.bin
+//   拿到这个文件之后：
+//   1. 用 Python msgpack 库解析，得到所有韩文字符串
+//   2. 翻译成中文
+//   3. 重新 msgpack 编码 → 重新加密 → 新的 kr.client
+//
+// 副目标：deob() 返回 Byte[]，可能是密钥或初始化数据
+//   RVA: 0x5edf930，保存到 /sdcard/Download/deob_result.bin
+
+// --- deop hook ---
+static bool deop_dumped = false;
+static void* (*old_deop)(void* arr_a) = nullptr;
+
+void* my_deop(void* arr_a) {
+    // 先保存数据，再交给原函数解析（保证游戏正常运行）
+    if (!deop_dumped && arr_a != nullptr) {
+        // Il2CppArray 结构：+0x18=长度, +0x20=数据
+        uint64_t len  = *(uint64_t*)((uint8_t*)arr_a + 0x18);
+        uint8_t* data = (uint8_t*)arr_a + 0x20;
+
+        LOGI("【deop拦截】调用！数组长度=%lu 头4字节=%02X%02X%02X%02X",
+             (unsigned long)len,
+             len>0?data[0]:0, len>1?data[1]:0,
+             len>2?data[2]:0, len>3?data[3]:0);
+
+        // MessagePack 以 0x80-0x8F（fixmap）或 0x82/0xDE/0xDF 开头
+        // 只保存看起来合理的数据（>1KB，避免小型无关调用）
+        if (len > 1024 && len < 50 * 1024 * 1024) {
+            deop_dumped = true;
+            const char* out = "/sdcard/Download/kr_plaintext.bin";
+            FILE* f = fopen(out, "wb");
+            if (f) {
+                fwrite(data, 1, (size_t)len, f);
+                fclose(f);
+                LOGI("【deop拦截】★★★ 成功保存 %lu 字节明文 -> %s", (unsigned long)len, out);
+            } else {
+                LOGI("【deop拦截】写文件失败！");
+            }
+        }
+    }
+    return old_deop(arr_a);
+}
+
+// --- deob hook（无参数，返回 Byte[]，可能是密钥）---
+static bool deob_dumped = false;
+static void* (*old_deob)() = nullptr;
+
+void* my_deob() {
+    void* result = old_deob();
+    if (!deob_dumped && result != nullptr) {
+        deob_dumped = true;
+        uint64_t len  = *(uint64_t*)((uint8_t*)result + 0x18);
+        uint8_t* data = (uint8_t*)result + 0x20;
+        LOGI("【deob拦截】返回 %lu 字节，头16字节: %s",
+             (unsigned long)len,
+             [&]() -> std::string {
+                 char buf[64] = {};
+                 for (uint64_t i = 0; i < len && i < 16; i++)
+                     snprintf(buf + strlen(buf), 4, "%02X ", data[i]);
+                 return std::string(buf);
+             }().c_str());
+        if (len > 0 && len < 10 * 1024 * 1024) {
+            const char* out = "/sdcard/Download/deob_result.bin";
+            FILE* f = fopen(out, "wb");
+            if (f) { fwrite(data, 1, (size_t)len, f); fclose(f); }
+            LOGI("【deob拦截】已保存 -> %s", out);
+        }
+    }
+    return result;
+}
+
 // ==================== 主入口 ====================
 void hack_start(const char *game_data_dir) {
     LOGI("hack_start inside, waiting for libil2cpp.so...");
@@ -259,15 +236,28 @@ void hack_start(const char *game_data_dir) {
             if (il2cpp_base != 0) {
                 il2cpp_string_new_ptr = (MyIl2CppString* (*)(const char*))xdl_sym(handle, "il2cpp_string_new", nullptr);
                 if (il2cpp_string_new_ptr != nullptr)
-                    LOGI("【成功】il2cpp_string_new 绑定成功 %p", il2cpp_string_new_ptr);
+                    LOGI("【成功】il2cpp_string_new 绑定 %p", il2cpp_string_new_ptr);
                 else
-                    LOGI("【错误】未能找到 il2cpp_string_new！");
+                    LOGI("【错误】未能绑定 il2cpp_string_new");
 
                 load_translation_dict();
 
+                // Hook 1：文本渲染（汉化功能）
                 void* set_text_addr = (void*)(il2cpp_base + 0xb670210);
                 DobbyHook(set_text_addr, (void*)my_set_text, (void**)&old_set_text);
-                LOGI("【成功】set_text Hook 完成，等待韩文触发内存扫描...");
+                LOGI("【成功】set_text Hook 完成");
+
+                // Hook 2：deop(Byte[] a) — 拦截解密后的 MessagePack 明文
+                // public static gop deop(Byte[] a)  RVA: 0x5edfa94
+                void* deop_addr = (void*)(il2cpp_base + 0x5edfa94);
+                DobbyHook(deop_addr, (void*)my_deop, (void**)&old_deop);
+                LOGI("【成功】deop Hook 安装（RVA: 0x5edfa94），等待明文...");
+
+                // Hook 3：deob() — 无参返回 Byte[]，可能是密钥
+                // public static Byte[] deob()  RVA: 0x5edf930
+                void* deob_addr = (void*)(il2cpp_base + 0x5edf930);
+                DobbyHook(deob_addr, (void*)my_deob, (void**)&old_deob);
+                LOGI("【成功】deob Hook 安装（RVA: 0x5edf930）");
             }
             break;
         }
