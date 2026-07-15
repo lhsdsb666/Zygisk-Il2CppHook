@@ -23,6 +23,24 @@
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
+// 第一次捕获到韩文时，打印调用栈
+static bool callstack_printed = false;
+if (!callstack_printed && contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
+    callstack_printed = true;
+    uintptr_t il2cpp_base = get_module_base("libil2cpp.so");
+    void** fp = (void**)__builtin_frame_address(0);
+    LOGI("【调用栈】==================");
+    for (int i = 0; i < 30 && fp != nullptr; i++) {
+        uintptr_t ra = (uintptr_t)(*(fp + 1));
+        if (ra > il2cpp_base)
+            LOGI("【调用栈 %02d】RVA 0x%lx", i, (unsigned long)(ra - il2cpp_base));
+        void** next = (void**)(*fp);
+        if (next <= fp) break;
+        fp = next;
+    }
+    LOGI("【调用栈】==================");
+}
+
 // ==================== 基础工具函数 ====================
 uintptr_t get_module_base(const char* module_name) {
     uintptr_t base = 0;
