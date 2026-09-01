@@ -149,6 +149,17 @@ bool contains_korean(const char16_t *chars, int len) {
     return false;
 }
 
+// 字典文件中的换行以字面 "\n" 转义存储（一行一条），而游戏字符串含真实换行，
+// 加载时必须还原，否则含换行的词条永远匹配不上
+static std::string unescape_newlines(std::string s) {
+    size_t p = 0;
+    while ((p = s.find("\\n", p)) != std::string::npos) {
+        s.replace(p, 2, "\n");
+        p += 1;
+    }
+    return s;
+}
+
 void load_translation_dict() {
     std::string path = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/string_data.txt";
     std::ifstream file(path);
@@ -162,7 +173,7 @@ void load_translation_dict() {
         if (line[0] == '#') continue;
         size_t pos = line.find('=');
         if (pos != std::string::npos) {
-            translation_map[line.substr(0, pos)] = line.substr(pos + 1);
+            translation_map[unescape_newlines(line.substr(0, pos))] = unescape_newlines(line.substr(pos + 1));
             count++;
         }
     }
@@ -481,6 +492,12 @@ void hack_start(const char *game_data_dir) {
             // 一次性任务：加载翻译字典 + 预加载已捕获文本（去重）
             load_translation_dict();
             preload_captured_texts();
+
+            // 延迟安装：游戏启动早期（epidgames logo 显示前后）存在完整性检测窗口，
+            // 过早安装 inline hook 会触发游戏自杀式闪退（kill SIGKILL，无崩溃日志）。
+            // 实测通过启动窗口后 hook 可长期稳定共存，故推迟安装以避开检测。
+            LOGI("【延迟安装】等待 25 秒以避开游戏启动检测窗口...");
+            sleep(25);
 
             // hook 安装带重试：启动早期 il2cpp 程序集可能尚未加载完毕
             bool hooked = false;
