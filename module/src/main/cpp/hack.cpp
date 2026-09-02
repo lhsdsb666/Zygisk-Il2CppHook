@@ -14,6 +14,11 @@
 //      —— 为静态解包收集 (密文块, Key) 样本
 //   9. 文本捕获与 dump 状态加锁（游戏多线程调用 set_text / 解密函数）
 //  10. crypto hook 逐原语幂等（部分成功重试时不会对已 hook 地址二次 DobbyHook）
+//  11. hook kill/tgkill：拦截针对自身的 SIGKILL（游戏启动完整性检测的自杀手段）
+//  12. hook 改为立即安装（不再 sleep 25）：自杀被拦截后无需躲避检测窗口，
+//      启动阶段的表解密（kr.client/scenariotextkr.client）才能被抓到
+//  13. 修复输入密文 dump 时机：mdq/ewdv 为原地解密（a==b 缓冲），必须在
+//      old_* 调用前 dump 密文，调用后 dump 明文，否则密文被明文覆盖
 
 #include "hack.h"
 #include "il2cpp_dump.h"
@@ -88,11 +93,33 @@ static bool is_main_game_process() {
 
 // ==================== Hook 退出函数（防自杀）====================
 
+#include <signal.h>
+
 static void (*old_exit)(int status) = nullptr;
 static void (*old__exit)(int status) = nullptr;
+static int (*old_kill)(pid_t, int) = nullptr;
+static int (*old_tgkill)(int, int, int) = nullptr;
 
 void my_exit(int status) { LOGI("【Hook】Blocked exit(%d)!", status); while (true) { sleep(3600); } }
 void my__exit(int status) { LOGI("【Hook】Blocked _exit(%d)!", status); while (true) { sleep(3600); } }
+
+// 拦截针对自身的 SIGKILL：游戏启动完整性检测失败时通过 kill(getpid(), SIGKILL)
+// 静默自杀（无崩溃日志）。仅拦截 SIGKILL 且目标是本进程，其余信号照常透传。
+static int my_kill(pid_t pid, int sig) {
+    if (sig == SIGKILL && pid == getpid()) {
+        LOGI("【Hook】Blocked self-kill(SIGKILL)!");
+        return 0;
+    }
+    return old_kill(pid, sig);
+}
+
+static int my_tgkill(int tgid, int tid, int sig) {
+    if (sig == SIGKILL && tgid == getpid()) {
+        LOGI("【Hook】Blocked self-tgkill(SIGKILL)!");
+        return 0;
+    }
+    return old_tgkill(tgid, tid, sig);
+}
 
 void hook_exit_functions() {
     void *libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
@@ -101,8 +128,12 @@ void hook_exit_functions() {
         if (exit_sym) DobbyHook(exit_sym, (void *)my_exit, (void **)&old_exit);
         void *_exit_sym = dlsym(libc, "_exit");
         if (_exit_sym) DobbyHook(_exit_sym, (void *)my__exit, (void **)&old__exit);
+        void *kill_sym = dlsym(libc, "kill");
+        if (kill_sym) DobbyHook(kill_sym, (void *)my_kill, (void **)&old_kill);
+        void *tgkill_sym = dlsym(libc, "tgkill");
+        if (tgkill_sym) DobbyHook(tgkill_sym, (void *)my_tgkill, (void **)&old_tgkill);
     }
-    LOGI("【Hook】Exit blocker active.");
+    LOGI("【Hook】Exit blocker + self-SIGKILL blocker active.");
 }
 
 // ==================== TextMeshPro 文本拦截器 ====================
@@ -352,7 +383,8 @@ static void (*old_nrf)(void *, int32_t, void *, int32_t, void *) = nullptr;
 static void (*old_ewel)(void *, int32_t, void *, int32_t, void *) = nullptr;
 static void (*old_lqg)(void *, int32_t, void *, int32_t, void *) = nullptr;
 
-static const char *kDumpDir = "/sdcard/Download/ewel_dumps";
+static const char *kDumpDir = "/sdcard/Download/ewel_dumps";   // 解密输出（明文）
+static const char *kInDir   = "/sdcard/Download/ewel_in";      // 解密输入（密文，用于还原文件层变换）
 static const int kDumpMaxFiles = 20000;  // 安全上限，防极端情况刷爆存储
 
 static std::mutex dump_mutex;                       // 解密可能发生在多线程
@@ -367,51 +399,83 @@ static uint64_t fnv1a_hash(const void *data, size_t len) {
     return h;
 }
 
-// 解密完成后 dump 输出 span（a_ptr/a_len）
-static void dump_decrypted(const char *func_name, void *a_ptr, int32_t a_len, NativeDecryptContext *ctx) {
-    if (a_ptr == nullptr || a_len < 16) return;  // 跳过哈希块等小调用
-
+// 解密调用后同时 dump 输出明文（a_ptr/a_len）与输入密文（b_ptr/b_len）：
+//   - 输出 -> ewel_dumps: 表明文样本
+//   - 输入 -> ewel_in:    与文件字节差分，还原文件层加密（密钥流 = 输入 XOR 文件区域）
+static void dump_decrypted(const char *func_name, void *a_ptr, int32_t a_len,
+                           void *b_ptr, int32_t b_len, NativeDecryptContext *ctx) {
     std::lock_guard<std::mutex> lk(dump_mutex);
     if (dump_count >= kDumpMaxFiles) return;
 
-    uint64_t h = fnv1a_hash(a_ptr, (size_t)a_len);
-    if (dumped_hashes.count(h)) return;  // 本轮已写过同样内容
+    unsigned key = ctx ? (uint32_t)ctx->Key : 0;
+    int idx = ctx ? ctx->Index : 0;
 
-    // 文件名: <函数>_key<Key>_len<长度>_<内容哈希>.bin
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s_key%08X_len%d_%016llX.bin",
-             kDumpDir, func_name,
-             (unsigned)(ctx ? (uint32_t)ctx->Key : 0), a_len, (unsigned long long)h);
+    // ---- 输出（明文）----
+    if (a_ptr != nullptr && a_len >= 16) {
+        uint64_t h = fnv1a_hash(a_ptr, (size_t)a_len);
+        if (!dumped_hashes.count(h)) {
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%s_key%08X_len%d_%016llX.bin",
+                     kDumpDir, func_name, key, a_len, (unsigned long long)h);
+            // 跨重启去重：上次运行已 dump 过同一块则跳过
+            if (FILE *test = fopen(path, "rb")) { fclose(test); dumped_hashes.insert(h); }
+            else {
+                mkdir(kDumpDir, 0777);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(a_ptr, 1, (size_t)a_len, f);
+                    fclose(f);
+                    dumped_hashes.insert(h);
+                    dump_count++;
+                    if (dump_count <= 20 || dump_count % 200 == 0)
+                        LOGI("【解密Dump】#%d %s out len=%d key=0x%08X", dump_count, func_name, a_len, key);
+                }
+            }
+        }
+    }
 
-    // 跨重启去重：上次运行已 dump 过同一块则跳过
-    if (FILE *test = fopen(path, "rb")) { fclose(test); dumped_hashes.insert(h); return; }
-
-    mkdir(kDumpDir, 0777);  // 已存在时返回 EEXIST，无碍
-    FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(a_ptr, 1, (size_t)a_len, f);
-        fclose(f);
-        dumped_hashes.insert(h);
-        dump_count++;
-        if (dump_count <= 20 || dump_count % 200 == 0)
-            LOGI("【解密Dump】#%d %s len=%d key=0x%08X -> %s",
-                 dump_count, func_name, a_len, ctx ? ctx->Key : 0, path);
+    // ---- 输入（密文）----
+    if (b_ptr != nullptr && b_len >= 4) {
+        uint64_t h = fnv1a_hash(b_ptr, (size_t)b_len);
+        if (!dumped_hashes.count(h ^ 0x494E505554ULL)) {  // 与输出哈希空间隔离
+            char path[256];
+            snprintf(path, sizeof(path), "%s/in_%s_key%08X_idx%d_len%d_%016llX.bin",
+                     kInDir, func_name, key, idx, b_len, (unsigned long long)h);
+            if (FILE *test = fopen(path, "rb")) { fclose(test); dumped_hashes.insert(h ^ 0x494E505554ULL); }
+            else {
+                mkdir(kInDir, 0777);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(b_ptr, 1, (size_t)b_len, f);
+                    fclose(f);
+                    dumped_hashes.insert(h ^ 0x494E505554ULL);
+                    dump_count++;
+                    if (dump_count <= 20 || dump_count % 200 == 0)
+                        LOGI("【解密Dump】#%d %s in len=%d key=0x%08X idx=%d", dump_count, func_name, b_len, key, idx);
+                }
+            }
+        }
     }
 }
 
+// 原语 hook：mdq/ewdv 使用原地解密（a 缓冲 == b 缓冲），old_* 执行后密文即被
+// 明文覆盖 —— 因此输入密文必须在调用前 dump，输出明文在调用后 dump。
 void my_nrf(void *a_ptr, int32_t a_len, void *b_ptr, int32_t b_len, void *ctx) {
+    dump_decrypted("nrf", nullptr, 0, b_ptr, b_len, (NativeDecryptContext *)ctx);
     old_nrf(a_ptr, a_len, b_ptr, b_len, ctx);
-    dump_decrypted("nrf", a_ptr, a_len, (NativeDecryptContext *)ctx);
+    dump_decrypted("nrf", a_ptr, a_len, nullptr, 0, (NativeDecryptContext *)ctx);
 }
 
 void my_ewel(void *a_ptr, int32_t a_len, void *b_ptr, int32_t b_len, void *ctx) {
+    dump_decrypted("ewel", nullptr, 0, b_ptr, b_len, (NativeDecryptContext *)ctx);
     old_ewel(a_ptr, a_len, b_ptr, b_len, ctx);
-    dump_decrypted("ewel", a_ptr, a_len, (NativeDecryptContext *)ctx);
+    dump_decrypted("ewel", a_ptr, a_len, nullptr, 0, (NativeDecryptContext *)ctx);
 }
 
 void my_lqg(void *a_ptr, int32_t a_len, void *b_ptr, int32_t b_len, void *ctx) {
+    dump_decrypted("lqg", nullptr, 0, b_ptr, b_len, (NativeDecryptContext *)ctx);
     old_lqg(a_ptr, a_len, b_ptr, b_len, ctx);
-    dump_decrypted("lqg", a_ptr, a_len, (NativeDecryptContext *)ctx);
+    dump_decrypted("lqg", a_ptr, a_len, nullptr, 0, (NativeDecryptContext *)ctx);
 }
 
 // 按名查找 res 类的三个解密原语并 hook（逐原语幂等：部分成功后重试只补装缺失的）
@@ -493,18 +557,15 @@ void hack_start(const char *game_data_dir) {
             load_translation_dict();
             preload_captured_texts();
 
-            // 延迟安装：游戏启动早期（epidgames logo 显示前后）存在完整性检测窗口，
-            // 过早安装 inline hook 会触发游戏自杀式闪退（kill SIGKILL，无崩溃日志）。
-            // 实测通过启动窗口后 hook 可长期稳定共存，故推迟安装以避开检测。
-            LOGI("【延迟安装】等待 25 秒以避开游戏启动检测窗口...");
-            sleep(25);
-
+            // 立即安装：self-SIGKILL 已被拦截，游戏启动完整性检测的自杀手段失效，
+            // 无需再靠 sleep(25) 躲避检测窗口。启动阶段的表解密（kr.client 等）
+            // 只有 hook 及时就位才能抓到 —— 这是静态解包的关键数据源。
             // hook 安装带重试：启动早期 il2cpp 程序集可能尚未加载完毕
             bool hooked = false;
-            for (int retry = 0; retry < 15 && !hooked; retry++) {
+            for (int retry = 0; retry < 30 && !hooked; retry++) {
                 hooked = install_hooks_by_name(handle);
                 if (!hooked) {
-                    LOGI("【重试】il2cpp 程序集未就绪，第 %d/15 次重试...", retry + 1);
+                    LOGI("【重试】il2cpp 程序集未就绪，第 %d/30 次重试...", retry + 1);
                     sleep(2);
                 }
             }
