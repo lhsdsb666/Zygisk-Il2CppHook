@@ -19,6 +19,16 @@
 //      启动阶段的表解密（kr.client/scenariotextkr.client）才能被抓到
 //  13. 修复输入密文 dump 时机：mdq/ewdv 为原地解密（a==b 缓冲），必须在
 //      old_* 调用前 dump 密文，调用后 dump 明文，否则密文被明文覆盖
+//  14. 新增表加载路径追踪探针（实验性）：
+//      - res 全部 Stream 读取入口（mdq/ewdp/ewdv/ewec/cgn/ful/ewds/ewdw/duq/ewdx/ewdo）
+//        首次调用打印调用栈 —— 判定 .client 表是否经过 res
+//      - MessagePack.LZ4.LZ4Codec.Decode / CLZF2.Decompress —— 抓压缩层输入与输出，
+//        若表数据经 LZ4/LZF 解压可直接获得表明文（dump 至 /sdcard/Download/probe_*）
+//      - TextAsset.get_bytes/get_text —— ≥64KB 资源 dump 内容并打印调用栈，
+//        定位读取 .client TextAsset 的代码链
+//      离线分析结论（2026-09-02）：静态 TextAsset 在全部 256 个单字节 XOR key 下
+//      均无 mdq 块链 [A][Hash][A-4] 结构，也无 LZ4 magic —— 表解密器另有其人，
+//      需要本组探针的运行时证据来定位
 
 #include "hack.h"
 #include "il2cpp_dump.h"
@@ -312,7 +322,8 @@ void my_ugi_set_text(void *__this, MyIl2CppString *il2cpp_string) {
 
 // ==================== 按名查找并安装 Hook ====================
 
-bool install_crypto_dumps();  // 前向声明：定义在下方解密 Dump 部分
+bool install_crypto_dumps();      // 前向声明：定义在下方解密 Dump 部分
+bool install_table_path_probes(); // 前向声明：定义在下方表加载路径追踪探针部分
 
 // 通用文本方法查找+hook：在全部程序集中按 命名空间.类名.方法名 查找 1 个 string 参数的方法
 static bool hook_text_method(const char *ns, const char *cls, const char *method_name,
@@ -346,6 +357,7 @@ bool install_hooks_by_name(void *handle) {
     static bool tmp_done = false;    // TextMeshPro 主路径
     static bool ugi_done = false;    // legacy uGUI Text（部分列表/旧UI使用）
     static bool crypto_done = false; // 解密函数 dump hook
+    static bool probe_done = false;  // 表加载路径追踪探针
 
     if (!tmp_done)
         tmp_done = hook_text_method("TMPro", "TMP_Text", "set_text",
@@ -359,6 +371,10 @@ bool install_hooks_by_name(void *handle) {
 
     if (!crypto_done)
         crypto_done = install_crypto_dumps();
+
+    // 探针独立于关键 hook：安装失败不阻塞主流程，随重试循环补装
+    if (!probe_done)
+        probe_done = install_table_path_probes();
 
     // crypto 依赖 Trickcal.AllShared 程序集就绪，未就绪时随重试循环补装
     return tmp_done && crypto_done;
@@ -521,6 +537,287 @@ bool install_crypto_dumps() {
         return false;
     }
     return false;
+}
+
+// ==================== 表加载路径追踪探针（实验性）====================
+// 背景：离线分析已确认 .client 表不走 res 的 mdq/ewel 路径（运行时 dump 无表级
+// 数据，静态 TextAsset 也无对应块结构）。本组探针采集运行时证据定位真正的表解密器。
+
+// IL2CPP 数组布局（64位）：klass@0x00 monitor@0x08 bounds@0x10 length@0x18 data@0x20
+// （bounds 在前，length 在后 —— 写反会把 bounds 指针当长度，全部 dump 静默失效）
+static uint8_t *probe_array_data(void *arr, int32_t *out_len) {
+    if (!arr) return nullptr;
+    void *bounds = *(void **)((uintptr_t)arr + 0x10);
+    int32_t len = *(int32_t *)((uintptr_t)arr + 0x18);
+    if (bounds != nullptr) return nullptr;  // 多维数组不处理
+    if (len <= 0 || len > (64 << 20)) return nullptr;
+    *out_len = len;
+    return (uint8_t *)((uintptr_t)arr + 0x20);
+}
+
+static int32_t probe_string_length(void *s) {
+    if (!s) return 0;
+    return *(int32_t *)((uintptr_t)s + 0x10);
+}
+
+// 带标签的调用栈打印（RVA 相对 libil2cpp.so 基址）
+static void print_callstack_tagged(const char *tag, int max_frames = 24) {
+    uintptr_t base = get_module_base("libil2cpp.so");
+    void **fp = (void **)__builtin_frame_address(0);
+    LOGI("【调用栈:%s】==================", tag);
+    for (int i = 0; i < max_frames && fp != nullptr; i++) {
+        uintptr_t ra = (uintptr_t)(*(fp + 1));
+        if (ra > base && base != 0)
+            LOGI("【%s#%02d】RVA 0x%lx", tag, i, (unsigned long)(ra - base));
+        void **next = (void **)(*fp);
+        if (next <= fp) break;
+        fp = next;
+    }
+    LOGI("【调用栈:%s】==================", tag);
+}
+
+// 探针 blob dump（按 tag 分目录，内容哈希去重，跨重启跳过已存在文件）
+static std::unordered_set<uint64_t> probe_dumped;
+static int probe_dump_count = 0;
+
+static void dump_probe_blob(const char *tag, const void *data, size_t len) {
+    if (data == nullptr || len < 16) return;
+    std::lock_guard<std::mutex> lk(dump_mutex);
+    if (probe_dump_count >= kDumpMaxFiles) return;
+    uint64_t h = fnv1a_hash(data, len);
+    if (!probe_dumped.insert(h).second) return;
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/sdcard/Download/probe_%s", tag);
+    mkdir("/sdcard/Download", 0777);
+    mkdir(dir, 0777);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s_len%zu_%016llX.bin", dir, tag, len,
+             (unsigned long long)h);
+    if (FILE *test = fopen(path, "rb")) { fclose(test); return; }  // 上轮已 dump
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(data, 1, len, f);
+        fclose(f);
+        probe_dump_count++;
+        if (probe_dump_count <= 20 || probe_dump_count % 100 == 0)
+            LOGI("【探针Dump】%s #%d len=%zu", tag, probe_dump_count, len);
+    }
+}
+
+// ---- 1) res Stream 读取入口追踪 ----
+
+static void *(*old_mdq)(void *, void *) = nullptr;    // reu mdq(Stream)
+static void *(*old_ewdp)(void *, void *) = nullptr;   // reu ewdp(Stream)
+static void *(*old_ewdv)(void *, void *) = nullptr;   // reu ewdv(Stream)
+static void *(*old_ewec)(void *, void *) = nullptr;   // String ewec(Stream)
+static void *(*old_cgn)(void *, void *) = nullptr;    // qea cgn(Stream)
+static bool (*old_ful)(void *, void *) = nullptr;     // Boolean ful(Stream)
+static bool (*old_ewds)(void *, void *) = nullptr;    // Boolean ewds(Stream)
+static bool (*old_ewdw)(void *, void *) = nullptr;    // Boolean ewdw(Stream)
+static int (*old_duq)(void *, void *) = nullptr;      // Int32 duq(Stream)
+static int (*old_ewdx)(void *, void *) = nullptr;     // Int32 ewdx(Stream)
+static int (*old_ewdo)(void *, void *) = nullptr;     // Int32 ewdo(Stream)
+
+static void trace_res_entry(const char *name) {
+    static std::unordered_map<std::string, int> counts;
+    static bool first_callstack_done = false;
+    std::lock_guard<std::mutex> lk(dump_mutex);
+    int c = ++counts[name];
+    if (c <= 3 || c % 500 == 0)
+        LOGI("【res入口】%s 第%d次调用", name, c);
+    if (!first_callstack_done) {
+        first_callstack_done = true;
+        print_callstack_tagged("res入口");
+    }
+}
+
+static void *my_mdq(void *self, void *stream)  { trace_res_entry("mdq");  return old_mdq(self, stream); }
+static void *my_ewdp(void *self, void *stream) { trace_res_entry("ewdp"); return old_ewdp(self, stream); }
+static void *my_ewdv(void *self, void *stream) { trace_res_entry("ewdv"); return old_ewdv(self, stream); }
+static void *my_ewec(void *self, void *stream) { trace_res_entry("ewec"); return old_ewec(self, stream); }
+static void *my_cgn(void *self, void *stream)  { trace_res_entry("cgn");  return old_cgn(self, stream); }
+static bool my_ful(void *self, void *stream)   { trace_res_entry("ful");  return old_ful(self, stream); }
+static bool my_ewds(void *self, void *stream)  { trace_res_entry("ewds"); return old_ewds(self, stream); }
+static bool my_ewdw(void *self, void *stream)  { trace_res_entry("ewdw"); return old_ewdw(self, stream); }
+static int my_duq(void *self, void *stream)    { trace_res_entry("duq");  return old_duq(self, stream); }
+static int my_ewdx(void *self, void *stream)   { trace_res_entry("ewdx"); return old_ewdx(self, stream); }
+static int my_ewdo(void *self, void *stream)   { trace_res_entry("ewdo"); return old_ewdo(self, stream); }
+
+// ---- 2) 压缩层探针：MessagePack.LZ4.LZ4Codec.Decode / CLZF2.Decompress ----
+
+// static Int32 Decode(Byte[] input, Int32 inputOffset, Int32 inputLength,
+//                     Byte[] output, Int32 outputOffset, Int32 outputLength)
+static int (*old_mp_lz4_decode)(void *, int32_t, int32_t, void *, int32_t, int32_t) = nullptr;
+
+static int my_mp_lz4_decode(void *input, int32_t inOff, int32_t inLen,
+                            void *output, int32_t outOff, int32_t outLen) {
+    int r = old_mp_lz4_decode(input, inOff, inLen, output, outOff, outLen);
+    // 输出 = 解压后的 MsgPack 明文（表/嵌套块），输入 = 压缩块
+    int32_t olen = 0, ilen = 0;
+    uint8_t *odata = probe_array_data(output, &olen);
+    if (odata != nullptr && r > 0 && outOff >= 0 && (int64_t)outOff + r <= olen)
+        dump_probe_blob("lz4out", odata + outOff, (size_t)r);
+    uint8_t *idata = probe_array_data(input, &ilen);
+    if (idata != nullptr && inLen > 0 && inOff >= 0 && (int64_t)inOff + inLen <= ilen)
+        dump_probe_blob("lz4in", idata + inOff, (size_t)inLen);
+    return r;
+}
+
+// static Byte[] Decompress(Byte[] inputBytes)
+static void *(*old_clzf2_dec)(void *) = nullptr;
+
+static void *my_clzf2_dec(void *input) {
+    void *r = old_clzf2_dec(input);
+    int32_t ilen = 0, rlen = 0;
+    uint8_t *idata = probe_array_data(input, &ilen);
+    if (idata != nullptr) dump_probe_blob("lzfsrc", idata, (size_t)ilen);
+    uint8_t *rdata = probe_array_data(r, &rlen);
+    if (rdata != nullptr) dump_probe_blob("lzfout", rdata, (size_t)rlen);
+    return r;
+}
+
+// ---- 3) TextAsset 探针：get_bytes / get_text ----
+
+static void *(*old_ta_bytes)(void *) = nullptr;
+static void *(*old_ta_text)(void *) = nullptr;
+
+static void *my_ta_bytes(void *self) {
+    void *r = old_ta_bytes(self);
+    int32_t len = 0;
+    uint8_t *d = probe_array_data(r, &len);
+    if (d != nullptr && len >= 65536) {
+        dump_probe_blob("textasset", d, (size_t)len);
+        static bool cs_done = false;
+        if (!cs_done) {
+            cs_done = true;
+            print_callstack_tagged("TextAsset.bytes");
+        }
+    }
+    return r;
+}
+
+static void *my_ta_text(void *self) {
+    void *r = old_ta_text(self);
+    int32_t len = probe_string_length(r);
+    if (len >= 65536) {
+        dump_probe_blob("textasset_str", (const void *)((uintptr_t)r + 0x14),
+                        (size_t)len * 2);  // UTF-16
+        static bool cs_done = false;
+        if (!cs_done) {
+            cs_done = true;
+            print_callstack_tagged("TextAsset.text");
+        }
+    }
+    return r;
+}
+
+// ---- 按名查找并安装全部探针（幂等，可随重试循环补装）----
+
+static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
+    auto domain = il2cpp_domain_get();
+    if (!domain) return nullptr;
+    size_t assembly_count = 0;
+    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &assembly_count);
+    if (!assemblies || assembly_count == 0) return nullptr;
+    for (size_t i = 0; i < assembly_count; i++) {
+        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        Il2CppClass *klass = il2cpp_class_from_name(image, ns, name);
+        if (klass) return klass;
+    }
+    return nullptr;
+}
+
+bool install_table_path_probes() {
+    static bool res_done = false, mp_done = false, clzf_done = false, ta_done = false;
+    if (res_done && mp_done && clzf_done && ta_done) return true;
+
+    // 1) res 入口（全局命名空间，Trickcal.AllShared）
+    if (!res_done) {
+        Il2CppClass *klass = find_class_in_assemblies("", "res");
+        if (klass) {
+            struct Entry { const char *name; void *replace; void **origin; bool ok; };
+            static Entry entries[] = {
+                {"mdq",  (void *)my_mdq,  (void **)&old_mdq,  false},
+                {"ewdp", (void *)my_ewdp, (void **)&old_ewdp, false},
+                {"ewdv", (void *)my_ewdv, (void **)&old_ewdv, false},
+                {"ewec", (void *)my_ewec, (void **)&old_ewec, false},
+                {"cgn",  (void *)my_cgn,  (void **)&old_cgn,  false},
+                {"ful",  (void *)my_ful,  (void **)&old_ful,  false},
+                {"ewds", (void *)my_ewds, (void **)&old_ewds, false},
+                {"ewdw", (void *)my_ewdw, (void **)&old_ewdw, false},
+                {"duq",  (void *)my_duq,  (void **)&old_duq,  false},
+                {"ewdx", (void *)my_ewdx, (void **)&old_ewdx, false},
+                {"ewdo", (void *)my_ewdo, (void **)&old_ewdo, false},
+            };
+            bool all = true;
+            for (auto &e : entries) {
+                if (e.ok) continue;
+                const MethodInfo *m = il2cpp_class_get_method_from_name(klass, e.name, 1);
+                if (m && m->methodPointer) {
+                    DobbyHook((void *)m->methodPointer, e.replace, e.origin);
+                    e.ok = true;
+                    LOGI("【探针】res.%s 入口追踪已安装", e.name);
+                } else {
+                    all = false;
+                }
+            }
+            res_done = all;
+        }
+    }
+
+    // 2) MessagePack.LZ4.LZ4Codec.Decode
+    if (!mp_done) {
+        Il2CppClass *klass = find_class_in_assemblies("MessagePack.LZ4", "LZ4Codec");
+        if (klass) {
+            const MethodInfo *m = il2cpp_class_get_method_from_name(klass, "Decode", 6);
+            if (m && m->methodPointer) {
+                DobbyHook((void *)m->methodPointer, (void *)my_mp_lz4_decode,
+                          (void **)&old_mp_lz4_decode);
+                mp_done = true;
+                LOGI("【探针】MessagePack.LZ4.LZ4Codec.Decode 已安装");
+            }
+        }
+    }
+
+    // 3) CLZF2.Decompress（UnityEngine.UI.Extensions）
+    if (!clzf_done) {
+        Il2CppClass *klass = find_class_in_assemblies("UnityEngine.UI.Extensions", "CLZF2");
+        if (klass) {
+            const MethodInfo *m = il2cpp_class_get_method_from_name(klass, "Decompress", 1);
+            if (m && m->methodPointer) {
+                DobbyHook((void *)m->methodPointer, (void *)my_clzf2_dec,
+                          (void **)&old_clzf2_dec);
+                clzf_done = true;
+                LOGI("【探针】CLZF2.Decompress 已安装");
+            }
+        }
+    }
+
+    // 4) TextAsset.get_bytes / get_text
+    if (!ta_done) {
+        Il2CppClass *klass = find_class_in_assemblies("UnityEngine", "TextAsset");
+        if (klass) {
+            const MethodInfo *m1 = il2cpp_class_get_method_from_name(klass, "get_bytes", 0);
+            if (m1 && m1->methodPointer) {
+                DobbyHook((void *)m1->methodPointer, (void *)my_ta_bytes,
+                          (void **)&old_ta_bytes);
+                LOGI("【探针】TextAsset.get_bytes 已安装");
+            } else {
+                LOGI("【提示】TextAsset.get_bytes 方法查找失败");
+            }
+            const MethodInfo *m2 = il2cpp_class_get_method_from_name(klass, "get_text", 0);
+            if (m2 && m2->methodPointer) {
+                DobbyHook((void *)m2->methodPointer, (void *)my_ta_text,
+                          (void **)&old_ta_text);
+                LOGI("【探针】TextAsset.get_text 已安装");
+            }
+            // get_bytes 为主探针；get_text 仅辅助
+            ta_done = (m1 && m1->methodPointer);
+        }
+    }
+
+    return res_done && mp_done && clzf_done && ta_done;
 }
 
 // ==================== 主入口 ====================
