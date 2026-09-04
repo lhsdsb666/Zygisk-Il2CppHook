@@ -1,42 +1,24 @@
 // Created by Perfare on 2020/7/4.
-// 重构版：按名查找替代硬编码 RVA + MuMu 6 / Android 15 兼容修复
-// 改动说明：
-//   1. 调用已有的 il2cpp_api_init() 初始化全部 il2cpp API 函数指针
-//   2. 用 il2cpp_class_from_name + il2cpp_class_get_method_from_name 按名查找 set_text，
-//      替代硬编码 RVA（0xb670210），游戏更新后零维护
-//   3. 移除 deob/deop hook（方法签名每次更新都变，且翻译功能不需要它们）
-//   4. NativeBridge 部分套用 dumper 模块的 MuMu 6 修复（xDL 取代 dlopen）
-//   5. x86 宿主 NativeBridge 失败时安全放弃，不再回退 hack_start
-// 优化版新增：
-//   6. 修复 install_crypto_dumps 缺前向声明的编译错误
-//   7. 修复 UI.Text hook 复用 my_set_text 导致调用错误原函数（TMP 实现）的崩溃隐患
-//   8. 解密 dump 内容哈希去重（内存 set + 跨重启文件存在检查），文件名携带 Key/长度
-//      —— 为静态解包收集 (密文块, Key) 样本
-//   9. 文本捕获与 dump 状态加锁（游戏多线程调用 set_text / 解密函数）
-//  10. crypto hook 逐原语幂等（部分成功重试时不会对已 hook 地址二次 DobbyHook）
-//  11. hook kill/tgkill：拦截针对自身的 SIGKILL（游戏启动完整性检测的自杀手段）
-//  12. hook 改为立即安装（不再 sleep 25）：自杀被拦截后无需躲避检测窗口，
-//      启动阶段的表解密（kr.client/scenariotextkr.client）才能被抓到
-//  13. 修复输入密文 dump 时机：mdq/ewdv 为原地解密（a==b 缓冲），必须在
-//      old_* 调用前 dump 密文，调用后 dump 明文，否则密文被明文覆盖
-//  14. 新增表加载路径追踪探针（实验性）：
-//      - res 全部 Stream 读取入口（mdq/ewdp/ewdv/ewec/cgn/ful/ewds/ewdw/duq/ewdx/ewdo）
-//        首次调用打印调用栈 —— 判定 .client 表是否经过 res
-//      - MessagePack.LZ4.LZ4Codec.Decode / CLZF2.Decompress —— 抓压缩层输入与输出，
-//        若表数据经 LZ4/LZF 解压可直接获得表明文（dump 至 /sdcard/Download/probe_*）
-//      - TextAsset.get_bytes/get_text —— ≥64KB 资源 dump 内容并打印调用栈，
-//        定位读取 .client TextAsset 的代码链
-//      离线分析结论（2026-09-02）：静态 TextAsset 在全部 256 个单字节 XOR key 下
-//      均无 mdq 块链 [A][Hash][A-4] 结构，也无 LZ4 magic —— 表解密器另有其人，
-//      需要本组探针的运行时证据来定位
-//  15. 新增 eti 类 AES 路径 hook（2026-09-04 反汇编结论）：
-//      eti.cntp(SymAlg, String password, out key, out iv) 是全部密码路径汇聚点，
-//      算法 = Rijndael(=AES) CFB8 + NoPadding，
-//      派生 = key/B64(SHA256(pw))[0:32], iv = 拼接串[32:48]（76B = 44B Base64 + 32B hash）
-//      hook cntp 直接 dump 密码字符串 + key/IV（/sdcard/Download/eti_key/）
-//      eti.cntj/rw/cbb/kis 是解密流工厂（File.OpenRead → 160B 头 → CryptoStream），
-//      dump 返回的 MemoryStream 内容（[160B头][解密数据]）即为解密后的表数据
-//      （/sdcard/Download/eti_stream/）—— 即使没有密码也能直接拿到表明文
+// Trickcal Revive 汉化模块（重构维护版，2026-09-04 精简）
+//
+// 当前只保留三条活路径（实验性解密 dump / 加解密探针 / 枚举类查找已全部删除：
+// 热更新后剧情装载原生侧化，托管层加解密探针实测全程零触发，留着只增崩溃面）：
+//   1. 文本翻译：按名 hook TMPro.TMP_Text.set_text 与 UnityEngine.UI.Text.set_text
+//      （il2cpp_class_from_name 按名查找，不硬编码 RVA，游戏更新零维护），
+//      查 string_data.txt 字典把韩文替换为中文。
+//   2. 韩文采集：set_text 钩子 + il2cpp_string_new / il2cpp_string_new_utf16
+//      全量捕获网。任何托管字符串（含原生 AssetBundle 反序列化直接构造的）
+//      创建时若含谚文，一律去重落盘 captured_korean.txt，供离线批量翻译。
+//      注意：hook 的是导出跳板解析出的【真实实现】，见 resolve_thunk_target()。
+//   3. 防自杀：hook exit/_exit/kill/tgkill，拦截启动完整性检测的自毁。
+//
+// 血的教训：Dobby arm64 内联补丁占 16 字节。il2cpp 导出常是 4~8 字节 B/BL 跳板
+//   且彼此相邻（实测 string_new 与 _utf16 相隔仅 8 字节），直接对导出地址
+//   hook 会互相覆盖补丁 → 游戏黑屏卡死。必须解析跳板到真实实现、校验目标间距
+//   ≥32 字节、确认未被 hook 过再安装。
+//
+// 兼容：MuMu/x86 宿主走 NativeBridge（xDL 取 NativeBridgeItf），Android 15 修复；
+//   子进程不注入；x86 NativeBridge 失败时安全放弃。
 
 #include "hack.h"
 #include "il2cpp_dump.h"
@@ -353,6 +335,42 @@ using string_new_u16_fn = MyIl2CppString *(*)(const char16_t *utf16, int32_t len
 static string_new_fn     old_string_new = nullptr;
 static string_new_u16_fn old_string_new_utf16 = nullptr;
 
+// ---- Dobby 安全护栏（2026-09-04 黑屏事故修复）----
+// 事故根因：il2cpp_string_new 与 il2cpp_string_new_utf16 两个导出在 libil2cpp
+// 中只是 4~8 字节的 B/BL 跳板，相邻仅 8 字节（实测 0x...36bc / 0x...36c4）；
+// Dobby 的 arm64 内联补丁占 16 字节（LDR Xn,[pc,#8]; BR Xn; .quad），直接对
+// 导出地址 hook 会互相覆盖：第二个钩子的 trampoline 把跳转数据当指令执行，
+// 游戏启动后第一次创建 UTF-16 字符串即卡死黑屏。
+// 解法：hook 前先沿 B/BL 跳板解析出【真实实现函数】再 hook（真实函数体大、
+// 间距充足，且 il2cpp 内部直接调用真实实现的路径也一并被覆盖）。
+
+// 若函数入口是 B/BL 跳转且目标落在 libil2cpp.so 范围内，返回跳转目标；否则原样返回
+static void *resolve_thunk_target(void *sym, uintptr_t base) {
+    if (!sym) return nullptr;
+    uint32_t w = *(volatile uint32_t *)sym;
+    uint32_t op = w & 0xFC000000;
+    if (op == 0x14000000 || op == 0x94000000) {  // B(000101) / BL(100101)
+        int32_t imm = (int32_t)(w & 0x03FFFFFF);
+        if (imm & 0x02000000) imm |= (int32_t)0xFC000000;  // 26 位立即数符号扩展
+        uintptr_t target = (uintptr_t)sym + (int64_t)imm * 4;
+        if (base != 0 && target > base && target < base + 0x10000000ULL) {
+            LOGI("【韩文库】%p 为 B/BL 跳板，解析到真实实现 %p", sym, (void *)target);
+            return (void *)target;
+        }
+        LOGI("【韩文库】%p 跳板目标 %p 超出 libil2cpp 范围，按原地址处理", sym, (void *)target);
+    }
+    return sym;
+}
+
+// 入口是否已是 Dobby 绝对跳转桩（LDR Xt,[pc,#8] 后接 BR Xn），防止重复 hook
+static bool already_dobby_patched(void *p) {
+    if (!p) return false;
+    volatile uint32_t *w = (volatile uint32_t *)p;
+    bool ldr_lit = (w[0] & 0xFC000000) == 0x58000000;  // LDR (literal)
+    bool br_xn   = (w[1] & 0xFFFFFC1F) == 0xD61F0000;  // BR Xn
+    return ldr_lit && br_xn;
+}
+
 static void net_capture_result(MyIl2CppString *s) {
     // s 是运行时刚构造返回的字符串对象，null 判断即可；长度字段按
     // IL2CPP 字符串布局（length@0x10）读取，record 内部另有长度上下限校验
@@ -373,10 +391,6 @@ static MyIl2CppString *my_string_new_utf16(const char16_t *utf16, int32_t len) {
 }
 
 // ==================== 按名查找并安装 Hook ====================
-
-bool install_crypto_dumps();      // 前向声明：定义在下方解密 Dump 部分
-bool install_table_path_probes(); // 前向声明：定义在下方表加载路径追踪探针部分
-static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name); // 前向声明：类查找（含枚举回退）
 
 // 通用文本方法查找+hook：在全部程序集中按 命名空间.类名.方法名 查找 1 个 string 参数的方法
 static bool hook_text_method(const char *ns, const char *cls, const char *method_name,
@@ -405,12 +419,12 @@ static bool hook_text_method(const char *ns, const char *cls, const char *method
     return false;
 }
 
-// 返回 true 表示关键 hook（TMP 文本 + 解密 dump）全部就绪；可安全重试，已装的不会重装
-bool install_hooks_by_name(void *handle) {
+// 返回 true 表示关键文本 hook（TMP 主路径）已就绪；可安全重试，已装的不会重装。
+// 文本翻译只依赖两个 set_text；表解密/探针等实验性代码已于 2026-09-04 移除
+// （热更新后剧情装载已原生侧化，托管层加解密探针全程零触发，留着只增崩溃面）。
+bool install_hooks_by_name() {
     static bool tmp_done = false;    // TextMeshPro 主路径
     static bool ugi_done = false;    // legacy uGUI Text（部分列表/旧UI使用）
-    static bool crypto_done = false; // 解密函数 dump hook
-    static bool probe_done = false;  // 表加载路径追踪探针
 
     if (!tmp_done)
         tmp_done = hook_text_method("TMPro", "TMP_Text", "set_text",
@@ -422,915 +436,7 @@ bool install_hooks_by_name(void *handle) {
     if (ugi_done)
         LOGI("【成功】legacy UI.Text 附加 Hook 生效，覆盖更多文本组件。");
 
-    if (!crypto_done)
-        crypto_done = install_crypto_dumps();
-
-    // 探针随重试循环补装；框架层 hook（mscorlib 版本无关）就绪即视为解密路径就位
-    if (!probe_done)
-        probe_done = install_table_path_probes();
-
-    // 完成条件：UI 文本 hook + 解密路径 hook。解密路径二选一即可：
-    //   crypto_done = 旧版 res XOR dump（依赖混淆类 res，热更新后已失效）
-    //   probe_done  = 框架层加解密 hook（SymmetricAlgorithm/CryptoStream/MemoryStream）
-    // 热更新后 res/eti 混淆类已改名，框架 hook 为当前版本实际主路径。
-    return tmp_done && (crypto_done || probe_done);
-}
-
-// ==================== 剧情表解密 Dump（静态解包辅助）====================
-// 原理：游戏用 Trickcal.AllShared.dll 的 res 类解密 .client 表文件（含剧情表 scenariotextkr）。
-// 逆向 libil2cpp.so 确认：nrf/ewel/lqg 均为单字节 XOR 流密码：
-//   out[i] = in[i] ^ key_byte(Index)   —— Key 随流位置 Index 推进
-//   DecryptContext { int Key; int Hash; int Index; }
-// hook 这三个函数，把解密后的明文 dump 到本地；文件名携带 Key 与内容哈希：
-//   1. 同一块内容重复解密（重复加载同一张表）只落盘一次
-//   2. (内容, Key) 样本可用于离线反推 Key 派生规律，实现静态解包
-
-struct NativeDecryptContext {
-    int32_t Key;
-    int32_t Hash;
-    int32_t Index;
-};
-
-static void (*old_nrf)(void *, int32_t, void *, int32_t, void *) = nullptr;
-static void (*old_ewel)(void *, int32_t, void *, int32_t, void *) = nullptr;
-static void (*old_lqg)(void *, int32_t, void *, int32_t, void *) = nullptr;
-
-static const char *kDumpDir = "/sdcard/Download/ewel_dumps";   // 解密输出（明文）
-static const char *kInDir   = "/sdcard/Download/ewel_in";      // 解密输入（密文，用于还原文件层变换）
-static const int kDumpMaxFiles = 20000;  // 安全上限，防极端情况刷爆存储
-
-static std::mutex dump_mutex;                       // 解密可能发生在多线程
-static std::unordered_set<uint64_t> dumped_hashes;  // 本轮已落盘内容
-static int dump_count = 0;
-
-// FNV-1a 64bit：快速内容指纹
-static uint64_t fnv1a_hash(const void *data, size_t len) {
-    const uint8_t *p = (const uint8_t *)data;
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
-    return h;
-}
-
-// 解密调用后同时 dump 输出明文（a_ptr/a_len）与输入密文（b_ptr/b_len）：
-//   - 输出 -> ewel_dumps: 表明文样本
-//   - 输入 -> ewel_in:    与文件字节差分，还原文件层加密（密钥流 = 输入 XOR 文件区域）
-static void dump_decrypted(const char *func_name, void *a_ptr, int32_t a_len,
-                           void *b_ptr, int32_t b_len, NativeDecryptContext *ctx) {
-    std::lock_guard<std::mutex> lk(dump_mutex);
-    if (dump_count >= kDumpMaxFiles) return;
-
-    unsigned key = ctx ? (uint32_t)ctx->Key : 0;
-    int idx = ctx ? ctx->Index : 0;
-
-    // ---- 输出（明文）----
-    if (a_ptr != nullptr && a_len >= 16) {
-        uint64_t h = fnv1a_hash(a_ptr, (size_t)a_len);
-        if (!dumped_hashes.count(h)) {
-            char path[256];
-            snprintf(path, sizeof(path), "%s/%s_key%08X_len%d_%016llX.bin",
-                     kDumpDir, func_name, key, a_len, (unsigned long long)h);
-            // 跨重启去重：上次运行已 dump 过同一块则跳过
-            if (FILE *test = fopen(path, "rb")) { fclose(test); dumped_hashes.insert(h); }
-            else {
-                mkdir(kDumpDir, 0777);
-                FILE *f = fopen(path, "wb");
-                if (f) {
-                    fwrite(a_ptr, 1, (size_t)a_len, f);
-                    fclose(f);
-                    dumped_hashes.insert(h);
-                    dump_count++;
-                    if (dump_count <= 20 || dump_count % 200 == 0)
-                        LOGI("【解密Dump】#%d %s out len=%d key=0x%08X", dump_count, func_name, a_len, key);
-                }
-            }
-        }
-    }
-
-    // ---- 输入（密文）----
-    if (b_ptr != nullptr && b_len >= 4) {
-        uint64_t h = fnv1a_hash(b_ptr, (size_t)b_len);
-        if (!dumped_hashes.count(h ^ 0x494E505554ULL)) {  // 与输出哈希空间隔离
-            char path[256];
-            snprintf(path, sizeof(path), "%s/in_%s_key%08X_idx%d_len%d_%016llX.bin",
-                     kInDir, func_name, key, idx, b_len, (unsigned long long)h);
-            if (FILE *test = fopen(path, "rb")) { fclose(test); dumped_hashes.insert(h ^ 0x494E505554ULL); }
-            else {
-                mkdir(kInDir, 0777);
-                FILE *f = fopen(path, "wb");
-                if (f) {
-                    fwrite(b_ptr, 1, (size_t)b_len, f);
-                    fclose(f);
-                    dumped_hashes.insert(h ^ 0x494E505554ULL);
-                    dump_count++;
-                    if (dump_count <= 20 || dump_count % 200 == 0)
-                        LOGI("【解密Dump】#%d %s in len=%d key=0x%08X idx=%d", dump_count, func_name, b_len, key, idx);
-                }
-            }
-        }
-    }
-}
-
-// 原语 hook：mdq/ewdv 使用原地解密（a 缓冲 == b 缓冲），old_* 执行后密文即被
-// 明文覆盖 —— 因此输入密文必须在调用前 dump，输出明文在调用后 dump。
-void my_nrf(void *a_ptr, int32_t a_len, void *b_ptr, int32_t b_len, void *ctx) {
-    dump_decrypted("nrf", nullptr, 0, b_ptr, b_len, (NativeDecryptContext *)ctx);
-    old_nrf(a_ptr, a_len, b_ptr, b_len, ctx);
-    dump_decrypted("nrf", a_ptr, a_len, nullptr, 0, (NativeDecryptContext *)ctx);
-}
-
-void my_ewel(void *a_ptr, int32_t a_len, void *b_ptr, int32_t b_len, void *ctx) {
-    dump_decrypted("ewel", nullptr, 0, b_ptr, b_len, (NativeDecryptContext *)ctx);
-    old_ewel(a_ptr, a_len, b_ptr, b_len, ctx);
-    dump_decrypted("ewel", a_ptr, a_len, nullptr, 0, (NativeDecryptContext *)ctx);
-}
-
-void my_lqg(void *a_ptr, int32_t a_len, void *b_ptr, int32_t b_len, void *ctx) {
-    dump_decrypted("lqg", nullptr, 0, b_ptr, b_len, (NativeDecryptContext *)ctx);
-    old_lqg(a_ptr, a_len, b_ptr, b_len, ctx);
-    dump_decrypted("lqg", a_ptr, a_len, nullptr, 0, (NativeDecryptContext *)ctx);
-}
-
-// 按名查找 res 类的三个解密原语并 hook（逐原语幂等：部分成功后重试只补装缺失的）
-bool install_crypto_dumps() {
-    static bool nrf_done = false, ewel_done = false, lqg_done = false;
-    if (nrf_done && ewel_done && lqg_done) return true;
-
-    // res 类：全局命名空间，位于 Trickcal.AllShared.dll。
-    // 注意：本游戏 il2cpp_class_from_name 对空命名空间的混淆类失效，必须走
-    // find_class_in_assemblies（内部含 image 类型枚举回退），否则 res 永远找不到。
-    Il2CppClass *klass = find_class_in_assemblies("", "res");
-    if (klass) {
-        LOGI("【解密Dump】找到 res 类，klass=%p", klass);
-        struct { const char *name; void *replace; void **origin; bool *done; } prims[] = {
-            {"nrf",  (void *)my_nrf,  (void **)&old_nrf,  &nrf_done},
-            {"ewel", (void *)my_ewel, (void **)&old_ewel, &ewel_done},
-            {"lqg",  (void *)my_lqg,  (void **)&old_lqg,  &lqg_done},
-        };
-        for (auto &p : prims) {
-            if (*p.done) continue;  // 已装过，避免对同一地址二次 DobbyHook
-            const MethodInfo *m = il2cpp_class_get_method_from_name(klass, p.name, 3);
-            if (m && m->methodPointer) {
-                DobbyHook((void *)m->methodPointer, p.replace, p.origin);
-                *p.done = true;
-                LOGI("【成功】res.%s Hook 完成（地址 %p）", p.name, m->methodPointer);
-            } else {
-                LOGE("【错误】res.%s 方法查找失败", p.name);
-            }
-        }
-        if (nrf_done && ewel_done && lqg_done) {
-            LOGI("【解密Dump】表解密拦截已激活，运行游戏加载任意界面后检查 %s/", kDumpDir);
-            return true;
-        }
-        // res 已找到但方法未找全：res 类唯一，无需继续遍历其它程序集
-        return false;
-    }
-    return false;
-}
-
-// ==================== 表加载路径追踪探针（实验性）====================
-// 背景：离线分析已确认 .client 表不走 res 的 mdq/ewel 路径（运行时 dump 无表级
-// 数据，静态 TextAsset 也无对应块结构）。本组探针采集运行时证据定位真正的表解密器。
-
-// IL2CPP 数组布局（64位）：klass@0x00 monitor@0x08 bounds@0x10 length@0x18 data@0x20
-// （bounds 在前，length 在后 —— 写反会把 bounds 指针当长度，全部 dump 静默失效）
-// 托管指针粗检：IL2CPP/GC 堆对象 16 字节对齐、位于高地址用户空间。
-// 防止 hook 到非预期对象（如返回值不是 MemoryStream）时解引用野指针崩溃。
-static bool looks_like_managed_ptr(const void *p) {
-    uintptr_t a = (uintptr_t)p;
-    return a >= 0x10000 && a < 0x80000000000ULL && (a & 0xF) == 0;
-}
-
-static uint8_t *probe_array_data(void *arr, int32_t *out_len) {
-    if (!arr || !looks_like_managed_ptr(arr)) return nullptr;
-    void *bounds = *(void **)((uintptr_t)arr + 0x10);
-    int32_t len = *(int32_t *)((uintptr_t)arr + 0x18);
-    if (bounds != nullptr) return nullptr;  // 多维数组不处理
-    if (len <= 0 || len > (64 << 20)) return nullptr;
-    *out_len = len;
-    return (uint8_t *)((uintptr_t)arr + 0x20);
-}
-
-static int32_t probe_string_length(void *s) {
-    if (!s || !looks_like_managed_ptr(s)) return 0;
-    int32_t n = *(int32_t *)((uintptr_t)s + 0x10);
-    return (n >= 0 && n < 1024 * 1024) ? n : 0;  // 合理字符串长度上限 1MB
-}
-
-// 带标签的调用栈打印（RVA 相对 libil2cpp.so 基址）
-static void print_callstack_tagged(const char *tag, int max_frames = 24) {
-    uintptr_t base = get_module_base("libil2cpp.so");
-    void **fp = (void **)__builtin_frame_address(0);
-    LOGI("【调用栈:%s】==================", tag);
-    for (int i = 0; i < max_frames && fp != nullptr; i++) {
-        uintptr_t ra = (uintptr_t)(*(fp + 1));
-        if (ra > base && base != 0)
-            LOGI("【%s#%02d】RVA 0x%lx", tag, i, (unsigned long)(ra - base));
-        void **next = (void **)(*fp);
-        if (next <= fp) break;
-        fp = next;
-    }
-    LOGI("【调用栈:%s】==================", tag);
-}
-
-// 探针 blob dump（按 tag 分目录，内容哈希去重，跨重启跳过已存在文件）
-static std::unordered_set<uint64_t> probe_dumped;
-static int probe_dump_count = 0;
-
-static void dump_probe_blob(const char *tag, const void *data, size_t len) {
-    if (data == nullptr || len < 16) return;
-    std::lock_guard<std::mutex> lk(dump_mutex);
-    if (probe_dump_count >= kDumpMaxFiles) return;
-    uint64_t h = fnv1a_hash(data, len);
-    if (!probe_dumped.insert(h).second) return;
-    char dir[256];
-    snprintf(dir, sizeof(dir), "/sdcard/Download/probe_%s", tag);
-    mkdir("/sdcard/Download", 0777);
-    mkdir(dir, 0777);
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s_len%zu_%016llX.bin", dir, tag, len,
-             (unsigned long long)h);
-    if (FILE *test = fopen(path, "rb")) { fclose(test); return; }  // 上轮已 dump
-    FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(data, 1, len, f);
-        fclose(f);
-        probe_dump_count++;
-        if (probe_dump_count <= 20 || probe_dump_count % 100 == 0)
-            LOGI("【探针Dump】%s #%d len=%zu", tag, probe_dump_count, len);
-    }
-}
-
-// ---- 1) res Stream 读取入口追踪 ----
-
-static void *(*old_mdq)(void *, void *) = nullptr;    // reu mdq(Stream)
-static void *(*old_ewdp)(void *, void *) = nullptr;   // reu ewdp(Stream)
-static void *(*old_ewdv)(void *, void *) = nullptr;   // reu ewdv(Stream)
-static void *(*old_ewec)(void *, void *) = nullptr;   // String ewec(Stream)
-static void *(*old_cgn)(void *, void *) = nullptr;    // qea cgn(Stream)
-static bool (*old_ful)(void *, void *) = nullptr;     // Boolean ful(Stream)
-static bool (*old_ewds)(void *, void *) = nullptr;    // Boolean ewds(Stream)
-static bool (*old_ewdw)(void *, void *) = nullptr;    // Boolean ewdw(Stream)
-static int (*old_duq)(void *, void *) = nullptr;      // Int32 duq(Stream)
-static int (*old_ewdx)(void *, void *) = nullptr;     // Int32 ewdx(Stream)
-static int (*old_ewdo)(void *, void *) = nullptr;     // Int32 ewdo(Stream)
-
-static void trace_res_entry(const char *name) {
-    static std::unordered_map<std::string, int> counts;
-    static bool first_callstack_done = false;
-    std::lock_guard<std::mutex> lk(dump_mutex);
-    int c = ++counts[name];
-    if (c <= 3 || c % 500 == 0)
-        LOGI("【res入口】%s 第%d次调用", name, c);
-    if (!first_callstack_done) {
-        first_callstack_done = true;
-        print_callstack_tagged("res入口");
-    }
-}
-
-static void *my_mdq(void *self, void *stream)  { trace_res_entry("mdq");  return old_mdq(self, stream); }
-static void *my_ewdp(void *self, void *stream) { trace_res_entry("ewdp"); return old_ewdp(self, stream); }
-static void *my_ewdv(void *self, void *stream) { trace_res_entry("ewdv"); return old_ewdv(self, stream); }
-static void *my_ewec(void *self, void *stream) { trace_res_entry("ewec"); return old_ewec(self, stream); }
-static void *my_cgn(void *self, void *stream)  { trace_res_entry("cgn");  return old_cgn(self, stream); }
-static bool my_ful(void *self, void *stream)   { trace_res_entry("ful");  return old_ful(self, stream); }
-static bool my_ewds(void *self, void *stream)  { trace_res_entry("ewds"); return old_ewds(self, stream); }
-static bool my_ewdw(void *self, void *stream)  { trace_res_entry("ewdw"); return old_ewdw(self, stream); }
-static int my_duq(void *self, void *stream)    { trace_res_entry("duq");  return old_duq(self, stream); }
-static int my_ewdx(void *self, void *stream)   { trace_res_entry("ewdx"); return old_ewdx(self, stream); }
-static int my_ewdo(void *self, void *stream)   { trace_res_entry("ewdo"); return old_ewdo(self, stream); }
-
-// ---- 2) 压缩层探针：MessagePack.LZ4.LZ4Codec.Decode / CLZF2.Decompress ----
-
-// static Int32 Decode(Byte[] input, Int32 inputOffset, Int32 inputLength,
-//                     Byte[] output, Int32 outputOffset, Int32 outputLength)
-static int (*old_mp_lz4_decode)(void *, int32_t, int32_t, void *, int32_t, int32_t) = nullptr;
-
-static int my_mp_lz4_decode(void *input, int32_t inOff, int32_t inLen,
-                            void *output, int32_t outOff, int32_t outLen) {
-    int r = old_mp_lz4_decode(input, inOff, inLen, output, outOff, outLen);
-    // 输出 = 解压后的 MsgPack 明文（表/嵌套块），输入 = 压缩块
-    int32_t olen = 0, ilen = 0;
-    uint8_t *odata = probe_array_data(output, &olen);
-    if (odata != nullptr && r > 0 && outOff >= 0 && (int64_t)outOff + r <= olen)
-        dump_probe_blob("lz4out", odata + outOff, (size_t)r);
-    uint8_t *idata = probe_array_data(input, &ilen);
-    if (idata != nullptr && inLen > 0 && inOff >= 0 && (int64_t)inOff + inLen <= ilen)
-        dump_probe_blob("lz4in", idata + inOff, (size_t)inLen);
-    return r;
-}
-
-// static Byte[] Decompress(Byte[] inputBytes)
-static void *(*old_clzf2_dec)(void *) = nullptr;
-
-static void *my_clzf2_dec(void *input) {
-    void *r = old_clzf2_dec(input);
-    int32_t ilen = 0, rlen = 0;
-    uint8_t *idata = probe_array_data(input, &ilen);
-    if (idata != nullptr) dump_probe_blob("lzfsrc", idata, (size_t)ilen);
-    uint8_t *rdata = probe_array_data(r, &rlen);
-    if (rdata != nullptr) dump_probe_blob("lzfout", rdata, (size_t)rlen);
-    return r;
-}
-
-// ---- 3) TextAsset 探针：get_bytes / get_text ----
-
-static void *(*old_ta_bytes)(void *) = nullptr;
-static void *(*old_ta_text)(void *) = nullptr;
-
-static void *my_ta_bytes(void *self) {
-    void *r = old_ta_bytes(self);
-    int32_t len = 0;
-    uint8_t *d = probe_array_data(r, &len);
-    if (d != nullptr && len >= 65536) {
-        dump_probe_blob("textasset", d, (size_t)len);
-        static bool cs_done = false;
-        if (!cs_done) {
-            cs_done = true;
-            print_callstack_tagged("TextAsset.bytes");
-        }
-    }
-    return r;
-}
-
-static void *my_ta_text(void *self) {
-    void *r = old_ta_text(self);
-    int32_t len = probe_string_length(r);
-    if (len >= 65536) {
-        dump_probe_blob("textasset_str", (const void *)((uintptr_t)r + 0x14),
-                        (size_t)len * 2);  // UTF-16
-        static bool cs_done = false;
-        if (!cs_done) {
-            cs_done = true;
-            print_callstack_tagged("TextAsset.text");
-        }
-    }
-    return r;
-}
-
-// ---- 5) eti 类 AES 解密路径 hook（2026-09-04 反汇编定位）----
-// eti.cntp(SymmetricAlgorithm a, String b, out Byte[] c, out Byte[] d)
-//   密钥派生：combined = ASCII(Base64(SHA256(UTF8(pw)))) ++ SHA256(pw)（76B）
-//             key = combined[0:KeySize/8]（默认 32B）, iv = combined[32:32+BlockSize/8]（默认 16B）
-//   算法由 cnto/bbm 配置：Mode=CFB(4), FeedbackSize=8, Padding=None(1)
-static void (*old_eti_cntp)(void *alg, void *pw, void **out_key, void **out_iv) = nullptr;
-
-static std::string eti_to_hex(const uint8_t *d, int n) {
-    static const char *hx = "0123456789ABCDEF";
-    std::string s;
-    for (int i = 0; i < n; i++) { s += hx[d[i] >> 4]; s += hx[d[i] & 15]; }
-    return s;
-}
-
-static void my_eti_cntp(void *alg, void *pw, void **out_key, void **out_iv) {
-    old_eti_cntp(alg, pw, out_key, out_iv);
-    // 密码字符串（IL2CPP string: length@0x10, UTF-16 chars@0x14）
-    if (pw != nullptr) {
-        int32_t plen = probe_string_length(pw);
-        if (plen > 0 && plen < 1024) {
-            static std::unordered_set<std::string> logged_pw;
-            std::string s = utf16_to_utf8((const char16_t *)((uintptr_t)pw + 0x14), plen);
-            dump_probe_blob("eti_pw", s.c_str(), s.size());
-            if (logged_pw.insert(s).second) {
-                LOGI("【密钥派生】password=\"%s\" (len=%d)", s.c_str(), plen);
-            }
-        }
-    }
-    // 派生结果 key/IV（out 参数指向 IL2CPP byte[] 槽位）
-    if (out_key != nullptr && *out_key != nullptr) {
-        int32_t klen = 0;
-        uint8_t *kd = probe_array_data(*out_key, &klen);
-        if (kd != nullptr && klen > 0) {
-            dump_probe_blob("eti_key", kd, (size_t)klen);
-            static std::string last_key;
-            std::string hex = eti_to_hex(kd, klen < 64 ? klen : 64);
-            if (hex != last_key) {
-                last_key = hex;
-                LOGI("【密钥派生】key len=%d hex=%s", klen, hex.c_str());
-            }
-        }
-    }
-    if (out_iv != nullptr && *out_iv != nullptr) {
-        int32_t ilen = 0;
-        uint8_t *id = probe_array_data(*out_iv, &ilen);
-        if (id != nullptr && ilen > 0) {
-            dump_probe_blob("eti_iv", id, (size_t)ilen);
-            static std::string last_iv;
-            std::string hex = eti_to_hex(id, ilen < 64 ? ilen : 64);
-            if (hex != last_iv) {
-                last_iv = hex;
-                LOGI("【密钥派生】iv len=%d hex=%s", ilen, hex.c_str());
-            }
-        }
-    }
-}
-
-// eti.cntj/rw/cbb/kis(String) → Stream 解密流工厂
-// eti.cnti(String a, String b, String c) = Path.Combine 包装，最终仍然走解密流（dump.cs 已验证）
-//   File.OpenRead(path) → 读 hlys=160B 头写入 MemoryStream → CryptoStream(其余, 解密器)
-//   → CopyTo 同一 MemoryStream → 返回。返回对象首字段(@0x10) = _buffer byte[]，
-//   内容 = [160B 头][AES 解密后的表数据]
-static void *(*old_eti_cnti)(void *a, void *b, void *c) = nullptr;
-static void *(*old_eti_cntj)(void *path) = nullptr;
-static void *(*old_eti_rw)(void *path) = nullptr;
-static void *(*old_eti_cbb)(void *path) = nullptr;
-static void *(*old_eti_kis)(void *path) = nullptr;
-
-static void eti_log_path(const char *factory, void *path) {
-    if (path == nullptr) return;
-    int32_t plen = probe_string_length(path);
-    if (plen <= 0 || plen >= 1024) return;
-    std::string p = utf16_to_utf8((const char16_t *)((uintptr_t)path + 0x14), plen);
-    static std::unordered_set<std::string> logged_paths;
-    if (logged_paths.insert(p).second) {
-        LOGI("【eti解密流】%s path=\"%s\"", factory, p.c_str());
-    }
-}
-
-static std::string eti_get_string(void *s) {
-    if (s == nullptr) return {};
-    int32_t n = probe_string_length(s);
-    if (n <= 0 || n >= 1024) return {};
-    return utf16_to_utf8((const char16_t *)((uintptr_t)s + 0x14), n);
-}
-
-static void eti_dump_result_stream(void *result) {
-    if (!looks_like_managed_ptr(result)) return;
-    void *buf = *(void **)((uintptr_t)result + 0x10);  // MemoryStream._buffer
-    if (!looks_like_managed_ptr(buf)) {
-        LOGI("【eti解密流】返回对象 _buffer 指针异常 %p（可能非 MemoryStream，跳过 dump）", buf);
-        return;
-    }
-    int32_t blen = 0;
-    uint8_t *bd = probe_array_data(buf, &blen);
-    if (bd != nullptr) dump_probe_blob("eti_stream", bd, (size_t)blen);
-}
-
-static void *my_eti_cnti(void *a, void *b, void *c) {
-    std::string A = eti_get_string(a), B = eti_get_string(b), C = eti_get_string(c);
-    if (!A.empty() || !B.empty() || !C.empty()) {
-        static std::unordered_map<std::string, bool> seen;
-        std::string key = A + "|" + B + "|" + C;
-        if (seen.find(key) == seen.end()) {
-            seen[key] = true;
-            LOGI("【eti解密流】cnti combine(\"%s\", \"%s\", \"%s\")", A.c_str(), B.c_str(), C.c_str());
-        }
-    }
-    void *r = old_eti_cnti(a, b, c);
-    eti_dump_result_stream(r);
-    return r;
-}
-static void *my_eti_cntj(void *path) { eti_log_path("cntj", path); void *r = old_eti_cntj(path); eti_dump_result_stream(r); return r; }
-static void *my_eti_rw(void *path)   { eti_log_path("rw", path);   void *r = old_eti_rw(path);   eti_dump_result_stream(r); return r; }
-static void *my_eti_cbb(void *path)  { eti_log_path("cbb", path);  void *r = old_eti_cbb(path);  eti_dump_result_stream(r); return r; }
-static void *my_eti_kis(void *path)  { eti_log_path("kis", path);  void *r = old_eti_kis(path);  eti_dump_result_stream(r); return r; }
-
-// ---- 框架层加解密 hook（版本无关兜底，2026-09-04 新增）----
-// 游戏热更新后 Assembly-CSharp 混淆类名全部重排（实测：枚举 169 个 image 约 4 万
-// 个类已无 eti/res，运行时 libil2cpp 符号地址与旧版固定偏移 0x331D0）。
-// 但 AES 解密最终必经 mscorlib 框架类，类名永远稳定：
-//   - SymmetricAlgorithm.set_Key / set_IV：直接抓 AES 密钥与 IV（RijndaelManaged
-//     不重写这两个 setter，hook 基类即可全部命中）
-//   - CryptoStream.ctor / Read：Read 返回的 buffer 即【解密后明文分块】
-//   - MemoryStream.ToArray：解密结果 CopyTo 到 MemoryStream 后，游戏取整表时
-//     大概率调用 ToArray()，可一次性拿到【整张表明文】（≥16KB 才落盘）
-static void (*old_sys_set_key)(void *, void *) = nullptr;
-static void (*old_sys_set_iv)(void *, void *) = nullptr;
-static int  (*old_sys_cs_read)(void *, void *, int32_t, int32_t) = nullptr;
-static void (*old_sys_cs_ctor)(void *, void *, void *, int32_t) = nullptr;
-static void *(*old_sys_ms_toarray)(void *) = nullptr;
-
-static void my_sys_set_key(void *thiz, void *arr) {
-    old_sys_set_key(thiz, arr);
-    int32_t n = 0;
-    uint8_t *d = probe_array_data(arr, &n);
-    if (d && n > 0) {
-        dump_probe_blob("sys_key", d, (size_t)n);
-        static std::string last;
-        std::string hx = eti_to_hex(d, n < 64 ? n : 64);
-        if (hx != last) { last = hx; LOGI("【系统加密】SymmetricAlgorithm.set_Key len=%d hex=%s", n, hx.c_str()); }
-    }
-}
-
-static void my_sys_set_iv(void *thiz, void *arr) {
-    old_sys_set_iv(thiz, arr);
-    int32_t n = 0;
-    uint8_t *d = probe_array_data(arr, &n);
-    if (d && n > 0) {
-        dump_probe_blob("sys_iv", d, (size_t)n);
-        static std::string last;
-        std::string hx = eti_to_hex(d, n < 64 ? n : 64);
-        if (hx != last) { last = hx; LOGI("【系统加密】SymmetricAlgorithm.set_IV len=%d hex=%s", n, hx.c_str()); }
-    }
-}
-
-// public override Int32 Read(Byte[] buffer, Int32 offset, Int32 count)
-static int my_sys_cs_read(void *thiz, void *buf, int32_t off, int32_t count) {
-    int r = old_sys_cs_read(thiz, buf, off, count);
-    if (r > 0) {
-        int32_t blen = 0;
-        uint8_t *bd = probe_array_data(buf, &blen);
-        if (bd && off >= 0 && (int64_t)off + r <= blen)
-            dump_probe_blob("sys_plain", bd + off, (size_t)r);  // 解密后明文分块
-    }
-    return r;
-}
-
-// .ctor(Stream stream, ICryptoTransform transform, CryptoStreamMode mode)
-static void my_sys_cs_ctor(void *thiz, void *stream, void *xform, int32_t mode) {
-    old_sys_cs_ctor(thiz, stream, xform, mode);
-    static int n = 0;
-    if (++n <= 20)
-        LOGI("【系统解密流】CryptoStream.ctor #%d mode=%d(0=读/解密 1=写/加密) stream=%p xform=%p",
-             n, mode, stream, xform);
-}
-
-// public virtual Byte[] ToArray()
-static void *my_sys_ms_toarray(void *thiz) {
-    void *arr = old_sys_ms_toarray(thiz);
-    int32_t n = 0;
-    uint8_t *d = probe_array_data(arr, &n);
-    if (d && n >= 16384) {  // 只抓大块：解密后的整张表；UI/临时小对象跳过
-        dump_probe_blob("sys_table", d, (size_t)n);
-        static int cnt = 0;
-        if (++cnt <= 30) LOGI("【系统解密流】MemoryStream.ToArray len=%d（疑似整表明文）", n);
-    }
-    return arr;
-}
-
-// 双保险：RijndaelManaged 重写了 CreateDecryptor(Byte[], Byte[]) / CreateEncryptor，
-// 游戏若直接用 2 参工厂（不先给 Key/IV 属性赋值），set_Key/set_IV 不会触发；
-// 这里直接从工厂参数抓 key/iv。本 hook 为附加项，查找失败不影响主流程。
-static void *(*old_sys_create_dec)(void *, void *, void *) = nullptr;
-static void *(*old_sys_create_enc)(void *, void *, void *) = nullptr;
-
-static void sys_dump_key_iv(const char *via, void *key, void *iv) {
-    int32_t kn = 0, ivn = 0;
-    uint8_t *kd = probe_array_data(key, &kn);
-    uint8_t *id = probe_array_data(iv, &ivn);
-    if (kd && kn > 0) {
-        dump_probe_blob("sys_key", kd, (size_t)kn);
-        static std::string last_k;
-        std::string hx = eti_to_hex(kd, kn < 64 ? kn : 64);
-        if (hx != last_k) { last_k = hx; LOGI("【系统加密】%s key len=%d hex=%s", via, kn, hx.c_str()); }
-    }
-    if (id && ivn > 0) {
-        dump_probe_blob("sys_iv", id, (size_t)ivn);
-        static std::string last_i;
-        std::string hx = eti_to_hex(id, ivn < 64 ? ivn : 64);
-        if (hx != last_i) { last_i = hx; LOGI("【系统加密】%s iv len=%d hex=%s", via, ivn, hx.c_str()); }
-    }
-}
-
-// public override ICryptoTransform CreateDecryptor(Byte[] rgbKey, Byte[] rgbIV)
-static void *my_sys_create_dec(void *thiz, void *key, void *iv) {
-    void *r = old_sys_create_dec(thiz, key, iv);
-    sys_dump_key_iv("RijndaelManaged.CreateDecryptor", key, iv);
-    return r;
-}
-
-// public override ICryptoTransform CreateEncryptor(Byte[] rgbKey, Byte[] rgbIV)
-static void *my_sys_create_enc(void *thiz, void *key, void *iv) {
-    void *r = old_sys_create_enc(thiz, key, iv);
-    sys_dump_key_iv("RijndaelManaged.CreateEncryptor", key, iv);
-    return r;
-}
-
-// ---- 按名查找并安装全部探针（幂等，可随重试循环补装）----
-
-// ---- 类查找：il2cpp_class_from_name 对混淆类失效 + 枚举回退 ----
-// 实测（2026-09-04，libil2cpp.so 反汇编证实）：本游戏 il2cpp_class_from_name
-// 内部在 image+0x30 懒建名称表，查找成功后还要做一轮字符串指针比较校验；
-// 对命名空间为空的混淆类（res/eti）始终返回 null（带命名空间的正常名类
-// 如 CLZF2/TextAsset 不受影响）。回退方案：用 il2cpp_image_get_class 按
-// 类型定义索引枚举 image 内全部类（Zygisk-Il2CppDumper 同款路径），
-// 直接对 klass->name / klass->namespaze 做 strcmp 内容比较。
-typedef size_t (*fn_image_get_class_count)(const void *image);
-typedef void *(*fn_image_get_class)(const void *image, size_t index);
-typedef const char *(*fn_class_get_name)(void *klass);
-typedef const char *(*fn_class_get_namespace)(void *klass);
-
-static fn_image_get_class_count  p_image_get_class_count = nullptr;
-static fn_image_get_class        p_image_get_class       = nullptr;
-static fn_class_get_name         p_class_get_name        = nullptr;
-static fn_class_get_namespace    p_class_get_namespace   = nullptr;
-
-static void enum_lookup_apis_init() {
-    static bool tried = false;
-    if (tried) return;
-    tried = true;
-    void *h = xdl_open("libil2cpp.so", 0);
-    if (!h) { LOGE("【类查找】枚举回退初始化失败：libil2cpp.so 打开失败"); return; }
-    size_t sz = 0;
-    p_image_get_class_count = (fn_image_get_class_count)xdl_sym(h, "il2cpp_image_get_class_count", &sz);
-    p_image_get_class       = (fn_image_get_class)xdl_sym(h, "il2cpp_image_get_class", &sz);
-    p_class_get_name        = (fn_class_get_name)xdl_sym(h, "il2cpp_class_get_name", &sz);
-    p_class_get_namespace   = (fn_class_get_namespace)xdl_sym(h, "il2cpp_class_get_namespace", &sz);
-    if (p_image_get_class_count && p_image_get_class && p_class_get_name)
-        LOGI("【类查找】枚举回退 API 就绪（image_get_class=%p, class_get_name=%p, ns=%p）",
-             p_image_get_class, p_class_get_name, p_class_get_namespace);
-    else
-        LOGE("【类查找】枚举回退 API 解析失败（%p %p %p %p）",
-             p_image_get_class_count, p_image_get_class, p_class_get_name, p_class_get_namespace);
-}
-
-static bool ns_is_empty(const char *s) { return s == nullptr || s[0] == '\0'; }
-
-// 类查找负缓存：全库枚举（169 image 约 4 万类）单次约 0.3s，重试循环里对
-// 已确认不存在的名字（热更新后改名的 res/eti）反复枚举纯属浪费。
-// 负缓存只作用于【枚举回退】路径；标准 class_from_name 快速路径每次仍执行，
-// 后加载程序集中新出现的类（走快速路径即可命中的框架/带命名空间类）不受影响。
-static std::unordered_set<std::string> g_class_lookup_negative;
-
-static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
-    auto domain = il2cpp_domain_get();
-    if (!domain) return nullptr;
-    size_t assembly_count = 0;
-    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &assembly_count);
-    if (!assemblies || assembly_count == 0) return nullptr;
-
-    // 1) 快速路径：标准按名查找（带命名空间的类走这里即可命中）
-    for (size_t i = 0; i < assembly_count; i++) {
-        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) continue;
-        Il2CppClass *klass = il2cpp_class_from_name(image, ns, name);
-        if (klass) return klass;
-    }
-
-    // 2) 回退路径：逐 image 枚举全部类型定义，直接比较 name/namespace 内容
-    enum_lookup_apis_init();
-    if (!p_image_get_class_count || !p_image_get_class || !p_class_get_name) return nullptr;
-
-    // 负缓存：此前已全库枚举确认不存在的名字，跳过昂贵枚举
-    std::string neg_key = std::string(ns ? ns : "") + "|" + name;
-    if (g_class_lookup_negative.count(neg_key)) return nullptr;
-
-    static bool logged_scan = false;
-    Il2CppClass *name_only_match = nullptr;
-    size_t name_only_count = 0;
-    const char *name_only_ns = nullptr;
-
-    for (size_t i = 0; i < assembly_count; i++) {
-        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) continue;
-        size_t cnt = p_image_get_class_count((const void *)image);
-        if (!logged_scan)
-            LOGI("【类查找】枚举 image[%zu] 类型数=%zu（目标 %s.%s）",
-                 i, cnt, (ns && ns[0]) ? ns : "<global>", name);
-        for (size_t j = 0; j < cnt; j++) {
-            Il2CppClass *klass = (Il2CppClass *)p_image_get_class((const void *)image, j);
-            if (!klass) continue;
-            const char *kn = p_class_get_name((void *)klass);
-            if (!kn || strcmp(kn, name) != 0) continue;
-            const char *kns = p_class_get_namespace ? p_class_get_namespace((void *)klass) : nullptr;
-            bool ns_ok = (ns && ns[0]) ? (kns && strcmp(kns, ns) == 0) : ns_is_empty(kns);
-            if (ns_ok) {
-                LOGI("【类查找】%s 通过枚举命中（class_from_name 对该类失效；namespace=\"%s\" image[%zu] idx=%zu）",
-                     name, kns ? kns : "", i, j);
-                return klass;
-            }
-            // 名字命中但命名空间不符：记录候选（应对命名空间被混淆成特殊字节的情况）
-            name_only_count++;
-            if (!name_only_match) { name_only_match = klass; name_only_ns = kns; }
-        }
-    }
-    logged_scan = true;
-
-    // 目标在全局命名空间时，若全部 image 中仅有 1 个同名类，即使命名空间字段
-    // 异常（非空/被混淆）也采用，但打出醒目告警便于日志复核
-    if ((!ns || !ns[0]) && name_only_count == 1 && name_only_match) {
-        LOGI("【类查找】%s 命名空间字段异常但全库唯一同名，采用之（namespace=\"%s\"）",
-             name, name_only_ns ? name_only_ns : "(null)");
-        return name_only_match;
-    }
-    if (name_only_count > 1)
-        LOGE("【类查找】%s 存在 %zu 个同名类但命名空间均不匹配，放弃", name, name_only_count);
-    g_class_lookup_negative.insert(neg_key);  // 全库枚举未命中：负缓存，后续重试直接跳过
-    return nullptr;
-}
-
-bool install_table_path_probes() {
-    static bool res_done = false, mp_done = false, clzf_done = false, ta_done = false,
-                eti_done = false, sys_done = false;
-    // 框架层 hook（mscorlib，类名永不混淆）是版本无关主路径，就绪即视为完成；
-    // res/eti 为旧版混淆类名，热更新后已不存在，不再作为完成条件
-    if (sys_done) return true;
-
-    // 1) res 入口（全局命名空间，Trickcal.AllShared）
-    if (!res_done) {
-        Il2CppClass *klass = find_class_in_assemblies("", "res");
-        if (klass) {
-            struct Entry { const char *name; void *replace; void **origin; bool ok; };
-            static Entry entries[] = {
-                {"mdq",  (void *)my_mdq,  (void **)&old_mdq,  false},
-                {"ewdp", (void *)my_ewdp, (void **)&old_ewdp, false},
-                {"ewdv", (void *)my_ewdv, (void **)&old_ewdv, false},
-                {"ewec", (void *)my_ewec, (void **)&old_ewec, false},
-                {"cgn",  (void *)my_cgn,  (void **)&old_cgn,  false},
-                {"ful",  (void *)my_ful,  (void **)&old_ful,  false},
-                {"ewds", (void *)my_ewds, (void **)&old_ewds, false},
-                {"ewdw", (void *)my_ewdw, (void **)&old_ewdw, false},
-                {"duq",  (void *)my_duq,  (void **)&old_duq,  false},
-                {"ewdx", (void *)my_ewdx, (void **)&old_ewdx, false},
-                {"ewdo", (void *)my_ewdo, (void **)&old_ewdo, false},
-            };
-            bool all = true;
-            for (auto &e : entries) {
-                if (e.ok) continue;
-                const MethodInfo *m = il2cpp_class_get_method_from_name(klass, e.name, 1);
-                if (m && m->methodPointer) {
-                    DobbyHook((void *)m->methodPointer, e.replace, e.origin);
-                    e.ok = true;
-                    LOGI("【探针】res.%s 入口追踪已安装", e.name);
-                } else {
-                    all = false;
-                }
-            }
-            res_done = all;
-        }
-    }
-
-    // 2) MessagePack.LZ4.LZ4Codec.Decode
-    if (!mp_done) {
-        Il2CppClass *klass = find_class_in_assemblies("MessagePack.LZ4", "LZ4Codec");
-        if (klass) {
-            const MethodInfo *m = il2cpp_class_get_method_from_name(klass, "Decode", 6);
-            if (m && m->methodPointer) {
-                DobbyHook((void *)m->methodPointer, (void *)my_mp_lz4_decode,
-                          (void **)&old_mp_lz4_decode);
-                mp_done = true;
-                LOGI("【探针】MessagePack.LZ4.LZ4Codec.Decode 已安装");
-            }
-        }
-    }
-
-    // 3) CLZF2.Decompress（UnityEngine.UI.Extensions）
-    if (!clzf_done) {
-        Il2CppClass *klass = find_class_in_assemblies("UnityEngine.UI.Extensions", "CLZF2");
-        if (klass) {
-            const MethodInfo *m = il2cpp_class_get_method_from_name(klass, "Decompress", 1);
-            if (m && m->methodPointer) {
-                DobbyHook((void *)m->methodPointer, (void *)my_clzf2_dec,
-                          (void **)&old_clzf2_dec);
-                clzf_done = true;
-                LOGI("【探针】CLZF2.Decompress 已安装");
-            }
-        }
-    }
-
-    // 4) TextAsset.get_bytes / get_text
-    if (!ta_done) {
-        Il2CppClass *klass = find_class_in_assemblies("UnityEngine", "TextAsset");
-        if (klass) {
-            const MethodInfo *m1 = il2cpp_class_get_method_from_name(klass, "get_bytes", 0);
-            if (m1 && m1->methodPointer) {
-                DobbyHook((void *)m1->methodPointer, (void *)my_ta_bytes,
-                          (void **)&old_ta_bytes);
-                LOGI("【探针】TextAsset.get_bytes 已安装");
-            } else {
-                LOGI("【提示】TextAsset.get_bytes 方法查找失败");
-            }
-            const MethodInfo *m2 = il2cpp_class_get_method_from_name(klass, "get_text", 0);
-            if (m2 && m2->methodPointer) {
-                DobbyHook((void *)m2->methodPointer, (void *)my_ta_text,
-                          (void **)&old_ta_text);
-                LOGI("【探针】TextAsset.get_text 已安装");
-            }
-            // get_bytes 为主探针；get_text 仅辅助
-            ta_done = (m1 && m1->methodPointer);
-        }
-    }
-
-    // 5) eti 类 AES 解密路径：cntp 密钥派生 + cnti(3参)/cntj/rw/cbb/kis 解密流工厂
-    //    - 1 参工厂 cntj/rw/cbb/kis 直接对文件路径解密
-    //    - 3 参工厂 cnti = Path.Combine 包装，剧情表加载也会走它（dump.cs 已验证）
-    if (!eti_done) {
-        Il2CppClass *klass = find_class_in_assemblies("", "eti");
-        if (klass) {
-            bool cntp_ok = false;
-            const MethodInfo *mp = il2cpp_class_get_method_from_name(klass, "cntp", 4);
-            if (mp && mp->methodPointer) {
-                DobbyHook((void *)mp->methodPointer, (void *)my_eti_cntp,
-                          (void **)&old_eti_cntp);
-                cntp_ok = true;
-                LOGI("【探针】eti.cntp 密钥派生已安装");
-            } else {
-                LOGI("【提示】eti.cntp 方法查找失败");
-            }
-            struct EtiEntry { const char *name; int argc; void *replace; void **origin; bool ok; };
-            static EtiEntry eti_entries[] = {
-                {"cnti", 3, (void *)my_eti_cnti, (void **)&old_eti_cnti, false},
-                {"cntj", 1, (void *)my_eti_cntj, (void **)&old_eti_cntj, false},
-                {"rw",   1, (void *)my_eti_rw,   (void **)&old_eti_rw,   false},
-                {"cbb",  1, (void *)my_eti_cbb,  (void **)&old_eti_cbb,  false},
-                {"kis",  1, (void *)my_eti_kis,  (void **)&old_eti_kis,  false},
-            };
-            bool all = true;
-            for (auto &e : eti_entries) {
-                if (e.ok) continue;
-                const MethodInfo *m = il2cpp_class_get_method_from_name(klass, e.name, e.argc);
-                if (m && m->methodPointer) {
-                    DobbyHook((void *)m->methodPointer, e.replace, e.origin);
-                    e.ok = true;
-                    LOGI("【探针】eti.%s 解密流工厂已安装（%d参）", e.name, e.argc);
-                } else {
-                    all = false;
-                    LOGI("【提示】eti.%s(%d) 方法查找失败", e.name, e.argc);
-                }
-            }
-            eti_done = cntp_ok && all;
-        } else {
-            LOGI("【提示】eti 类查找失败（AES 解密路径 hook 未安装）");
-        }
-    }
-
-    // 6) 框架层加解密 hook（版本无关主路径，2026-09-04）
-    //    游戏热更新后 Assembly-CSharp 混淆类名全部重排（枚举 169 image 约 4 万
-    //    类已无 eti/res），但 AES 解密最终必经 mscorlib 框架类，类名永不混淆：
-    //    - SymmetricAlgorithm.set_Key/set_IV：抓 AES 密钥/IV。RijndaelManaged
-    //      不重写这两个 setter（无参 CreateDecryptor 路径必经属性赋值），
-    //      hook 基类即命中全部对称算法实例
-    //    - RijndaelManaged.CreateDecryptor/CreateEncryptor(2参)：双保险，
-    //      直接从工厂参数抓 key/iv（附加项，查找失败不阻塞）
-    //    - CryptoStream..ctor(3参)/Read(3参)：Read 返回 buffer 即解密明文分块
-    //    - MemoryStream.ToArray(0参)：解密 CopyTo 后取整表，≥16KB 才落盘
-    if (!sys_done) {
-        bool sys_ok = true;
-
-        Il2CppClass *sa = find_class_in_assemblies("System.Security.Cryptography",
-                                                   "SymmetricAlgorithm");
-        if (sa) {
-            const MethodInfo *mk = il2cpp_class_get_method_from_name(sa, "set_Key", 1);
-            if (mk && mk->methodPointer) {
-                DobbyHook((void *)mk->methodPointer, (void *)my_sys_set_key,
-                          (void **)&old_sys_set_key);
-                LOGI("【探针】SymmetricAlgorithm.set_Key 已安装（地址 %p）", mk->methodPointer);
-            } else { sys_ok = false; LOGI("【提示】SymmetricAlgorithm.set_Key 查找失败"); }
-
-            const MethodInfo *miv = il2cpp_class_get_method_from_name(sa, "set_IV", 1);
-            if (miv && miv->methodPointer) {
-                DobbyHook((void *)miv->methodPointer, (void *)my_sys_set_iv,
-                          (void **)&old_sys_set_iv);
-                LOGI("【探针】SymmetricAlgorithm.set_IV 已安装（地址 %p）", miv->methodPointer);
-            } else { sys_ok = false; LOGI("【提示】SymmetricAlgorithm.set_IV 查找失败"); }
-        } else { sys_ok = false; LOGI("【提示】SymmetricAlgorithm 类查找失败"); }
-
-        Il2CppClass *csk = find_class_in_assemblies("System.Security.Cryptography",
-                                                    "CryptoStream");
-        if (csk) {
-            const MethodInfo *mc = il2cpp_class_get_method_from_name(csk, ".ctor", 3);
-            if (mc && mc->methodPointer) {
-                DobbyHook((void *)mc->methodPointer, (void *)my_sys_cs_ctor,
-                          (void **)&old_sys_cs_ctor);
-                LOGI("【探针】CryptoStream..ctor(3参) 已安装（地址 %p）", mc->methodPointer);
-            } else { sys_ok = false; LOGI("【提示】CryptoStream..ctor(3参) 查找失败"); }
-
-            const MethodInfo *mr = il2cpp_class_get_method_from_name(csk, "Read", 3);
-            if (mr && mr->methodPointer) {
-                DobbyHook((void *)mr->methodPointer, (void *)my_sys_cs_read,
-                          (void **)&old_sys_cs_read);
-                LOGI("【探针】CryptoStream.Read(3参) 已安装（地址 %p）", mr->methodPointer);
-            } else { sys_ok = false; LOGI("【提示】CryptoStream.Read(3参) 查找失败"); }
-        } else { sys_ok = false; LOGI("【提示】CryptoStream 类查找失败"); }
-
-        Il2CppClass *ms = find_class_in_assemblies("System.IO", "MemoryStream");
-        if (ms) {
-            const MethodInfo *mt = il2cpp_class_get_method_from_name(ms, "ToArray", 0);
-            if (mt && mt->methodPointer) {
-                DobbyHook((void *)mt->methodPointer, (void *)my_sys_ms_toarray,
-                          (void **)&old_sys_ms_toarray);
-                LOGI("【探针】MemoryStream.ToArray 已安装（地址 %p）", mt->methodPointer);
-            } else { sys_ok = false; LOGI("【提示】MemoryStream.ToArray 查找失败"); }
-        } else { sys_ok = false; LOGI("【提示】MemoryStream 类查找失败"); }
-
-        // 附加双保险：RijndaelManaged 的 2 参加解密工厂（不存在/未重写则跳过，
-        // 不影响 sys_ok——基类 SymmetricAlgorithm 的 2 参工厂内部会调 setter）
-        Il2CppClass *rm = find_class_in_assemblies("System.Security.Cryptography",
-                                                   "RijndaelManaged");
-        if (rm) {
-            const MethodInfo *md = il2cpp_class_get_method_from_name(rm, "CreateDecryptor", 2);
-            if (md && md->methodPointer) {
-                DobbyHook((void *)md->methodPointer, (void *)my_sys_create_dec,
-                          (void **)&old_sys_create_dec);
-                LOGI("【探针】RijndaelManaged.CreateDecryptor(2参) 已安装（地址 %p）", md->methodPointer);
-            } else {
-                LOGI("【提示】RijndaelManaged.CreateDecryptor(2参) 未找到（依赖 set_Key 路径）");
-            }
-            const MethodInfo *me = il2cpp_class_get_method_from_name(rm, "CreateEncryptor", 2);
-            if (me && me->methodPointer) {
-                DobbyHook((void *)me->methodPointer, (void *)my_sys_create_enc,
-                          (void **)&old_sys_create_enc);
-                LOGI("【探针】RijndaelManaged.CreateEncryptor(2参) 已安装（地址 %p）", me->methodPointer);
-            }
-        } else {
-            LOGI("【提示】RijndaelManaged 类未找到（依赖 set_Key/set_IV 路径抓密钥）");
-        }
-
-        sys_done = sys_ok;
-        if (sys_done)
-            LOGI("【探针】框架层加解密 hook 安装完成（set_Key/set_IV/CryptoStream/MemoryStream 已就位）");
-    }
-
-    return sys_done;
+    return tmp_done;
 }
 
 // ==================== 主入口 ====================
@@ -1367,41 +473,61 @@ void hack_start(const char *game_data_dir) {
             load_translation_dict();
             preload_captured_texts();
 
-            // 全量韩文捕获网：hook 字符串创建 API（版本无关）。
+            // 全量韩文捕获网：hook 字符串创建 API 的【真实实现】（版本无关）。
             // 任何托管字符串（含原生 AssetBundle 反序列化直接构造的）都要经过
-            // 这两个导出函数，韩文一律入库；失败安全，装不上也不影响翻译。
+            // 这两个函数，韩文一律入库；失败安全，装不上也不影响翻译。
+            // 安全要点：导出符号是 4~8 字节 B 跳板且相邻仅 8 字节，绝不能直接
+            // hook 导出地址（16 字节补丁会互相踩踏 → 黑屏卡死）。必须先解析
+            // 跳板到真实实现，并校验两个目标间距 ≥ 32 字节、且未被 hook 过。
             {
-                void *p_new = (void *)xdl_sym(handle, "il2cpp_string_new", &sym_size);
-                size_t sym_size2 = 0;
-                void *p_u16 = (void *)xdl_sym(handle, "il2cpp_string_new_utf16", &sym_size2);
-                if (p_new) {
-                    if (DobbyHook(p_new, (void *)my_string_new, (void **)&old_string_new) == 0) {
-                        // 我们自己造中文替换串时直接走 trampoline，跳过本 hook
+                size_t sz1 = 0, sz2 = 0;
+                void *sym_new = (void *)xdl_sym(handle, "il2cpp_string_new", &sz1);
+                void *sym_u16 = (void *)xdl_sym(handle, "il2cpp_string_new_utf16", &sz2);
+                uintptr_t il2cpp_base_addr = get_module_base("libil2cpp.so");
+                void *t_new = resolve_thunk_target(sym_new, il2cpp_base_addr);
+                void *t_u16 = resolve_thunk_target(sym_u16, il2cpp_base_addr);
+                LOGI("【韩文库】符号：string_new 导出=%p 目标=%p；utf16 导出=%p 目标=%p",
+                     sym_new, t_new, sym_u16, t_u16);
+
+                bool spaced = true;
+                if (t_new && t_u16) {
+                    uintptr_t d = (uintptr_t)t_new > (uintptr_t)t_u16
+                                      ? (uintptr_t)t_new - (uintptr_t)t_u16
+                                      : (uintptr_t)t_u16 - (uintptr_t)t_new;
+                    if (d < 0x20) {
+                        spaced = false;
+                        LOGE("【韩文库】两个目标间距仅 %lu 字节（<32），放弃安装以防补丁互踩",
+                             (unsigned long)d);
+                    }
+                }
+
+                if (spaced && t_new && !already_dobby_patched(t_new)) {
+                    if (DobbyHook(t_new, (void *)my_string_new, (void **)&old_string_new) == 0) {
+                        // 自己造中文替换串时走 trampoline 直抵真实实现，绕过本 hook（防递归/自抓）
                         il2cpp_string_new_ptr = (MyIl2CppString *(*)(const char *))old_string_new;
-                        LOGI("【成功】全量韩文库已安装：il2cpp_string_new @ %p", p_new);
+                        LOGI("【成功】全量韩文库已安装：il2cpp_string_new 真实实现 @ %p", t_new);
                     } else {
                         LOGI("【提示】il2cpp_string_new hook 安装失败，跳过（不影响翻译）");
                     }
-                } else {
-                    LOGI("【提示】未找到 il2cpp_string_new 导出，全量韩文库跳过");
                 }
-                if (p_u16) {
-                    if (DobbyHook(p_u16, (void *)my_string_new_utf16, (void **)&old_string_new_utf16) == 0)
-                        LOGI("【成功】全量韩文库已安装：il2cpp_string_new_utf16 @ %p", p_u16);
+                if (spaced && t_u16 && !already_dobby_patched(t_u16)) {
+                    if (DobbyHook(t_u16, (void *)my_string_new_utf16,
+                                  (void **)&old_string_new_utf16) == 0)
+                        LOGI("【成功】全量韩文库已安装：il2cpp_string_new_utf16 真实实现 @ %p", t_u16);
                     else
                         LOGI("【提示】il2cpp_string_new_utf16 hook 安装失败，跳过（不影响翻译）");
-                } else {
-                    LOGI("【提示】未找到 il2cpp_string_new_utf16 导出，utf16 捕获跳过");
                 }
+                if (!t_new || !t_u16)
+                    LOGI("【提示】字符串创建符号未找到，全量韩文库跳过（set_text 捕获仍有效）");
             }
 
             // 立即安装：self-SIGKILL 已被拦截，游戏启动完整性检测的自杀手段失效，
-            // 无需再靠 sleep(25) 躲避检测窗口。启动阶段的表解密（kr.client 等）
-            // 只有 hook 及时就位才能抓到 —— 这是静态解包的关键数据源。
+            // 无需再靠 sleep(25) 躲避检测窗口。文本 hook 越早就位，启动阶段的
+            // 韩文捕获与翻译覆盖越完整。
             // hook 安装带重试：启动早期 il2cpp 程序集可能尚未加载完毕
             bool hooked = false;
             for (int retry = 0; retry < 30 && !hooked; retry++) {
-                hooked = install_hooks_by_name(handle);
+                hooked = install_hooks_by_name();
                 if (!hooked) {
                     LOGI("【重试】il2cpp 程序集未就绪，第 %d/30 次重试...", retry + 1);
                     sleep(2);
