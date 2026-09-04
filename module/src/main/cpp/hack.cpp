@@ -29,6 +29,14 @@
 //      离线分析结论（2026-09-02）：静态 TextAsset 在全部 256 个单字节 XOR key 下
 //      均无 mdq 块链 [A][Hash][A-4] 结构，也无 LZ4 magic —— 表解密器另有其人，
 //      需要本组探针的运行时证据来定位
+//  15. 新增 eti 类 AES 路径 hook（2026-09-04 反汇编结论）：
+//      eti.cntp(SymAlg, String password, out key, out iv) 是全部密码路径汇聚点，
+//      算法 = Rijndael(=AES) CFB8 + NoPadding，
+//      派生 = key/B64(SHA256(pw))[0:32], iv = 拼接串[32:48]（76B = 44B Base64 + 32B hash）
+//      hook cntp 直接 dump 密码字符串 + key/IV（/sdcard/Download/eti_key/）
+//      eti.cntj/rw/cbb/kis 是解密流工厂（File.OpenRead → 160B 头 → CryptoStream），
+//      dump 返回的 MemoryStream 内容（[160B头][解密数据]）即为解密后的表数据
+//      （/sdcard/Download/eti_stream/）—— 即使没有密码也能直接拿到表明文
 
 #include "hack.h"
 #include "il2cpp_dump.h"
@@ -711,6 +719,96 @@ static void *my_ta_text(void *self) {
     return r;
 }
 
+// ---- 5) eti 类 AES 解密路径 hook（2026-09-04 反汇编定位）----
+// eti.cntp(SymmetricAlgorithm a, String b, out Byte[] c, out Byte[] d)
+//   密钥派生：combined = ASCII(Base64(SHA256(UTF8(pw)))) ++ SHA256(pw)（76B）
+//             key = combined[0:KeySize/8]（默认 32B）, iv = combined[32:32+BlockSize/8]（默认 16B）
+//   算法由 cnto/bbm 配置：Mode=CFB(4), FeedbackSize=8, Padding=None(1)
+static void (*old_eti_cntp)(void *alg, void *pw, void **out_key, void **out_iv) = nullptr;
+
+static std::string eti_to_hex(const uint8_t *d, int n) {
+    static const char *hx = "0123456789ABCDEF";
+    std::string s;
+    for (int i = 0; i < n; i++) { s += hx[d[i] >> 4]; s += hx[d[i] & 15]; }
+    return s;
+}
+
+static void my_eti_cntp(void *alg, void *pw, void **out_key, void **out_iv) {
+    old_eti_cntp(alg, pw, out_key, out_iv);
+    // 密码字符串（IL2CPP string: length@0x10, UTF-16 chars@0x14）
+    if (pw != nullptr) {
+        int32_t plen = probe_string_length(pw);
+        if (plen > 0 && plen < 1024) {
+            static std::unordered_set<std::string> logged_pw;
+            std::string s = utf16_to_utf8((const char16_t *)((uintptr_t)pw + 0x14), plen);
+            dump_probe_blob("eti_pw", s.c_str(), s.size());
+            if (logged_pw.insert(s).second) {
+                LOGI("【密钥派生】password=\"%s\" (len=%d)", s.c_str(), plen);
+            }
+        }
+    }
+    // 派生结果 key/IV（out 参数指向 IL2CPP byte[] 槽位）
+    if (out_key != nullptr && *out_key != nullptr) {
+        int32_t klen = 0;
+        uint8_t *kd = probe_array_data(*out_key, &klen);
+        if (kd != nullptr && klen > 0) {
+            dump_probe_blob("eti_key", kd, (size_t)klen);
+            static std::string last_key;
+            std::string hex = eti_to_hex(kd, klen < 64 ? klen : 64);
+            if (hex != last_key) {
+                last_key = hex;
+                LOGI("【密钥派生】key len=%d hex=%s", klen, hex.c_str());
+            }
+        }
+    }
+    if (out_iv != nullptr && *out_iv != nullptr) {
+        int32_t ilen = 0;
+        uint8_t *id = probe_array_data(*out_iv, &ilen);
+        if (id != nullptr && ilen > 0) {
+            dump_probe_blob("eti_iv", id, (size_t)ilen);
+            static std::string last_iv;
+            std::string hex = eti_to_hex(id, ilen < 64 ? ilen : 64);
+            if (hex != last_iv) {
+                last_iv = hex;
+                LOGI("【密钥派生】iv len=%d hex=%s", ilen, hex.c_str());
+            }
+        }
+    }
+}
+
+// eti.cntj/rw/cbb/kis(String) → Stream 解密流工厂
+//   File.OpenRead(path) → 读 hlys=160B 头写入 MemoryStream → CryptoStream(其余, 解密器)
+//   → CopyTo 同一 MemoryStream → 返回。返回对象首字段(@0x10) = _buffer byte[]，
+//   内容 = [160B 头][AES 解密后的表数据]
+static void *(*old_eti_cntj)(void *path) = nullptr;
+static void *(*old_eti_rw)(void *path) = nullptr;
+static void *(*old_eti_cbb)(void *path) = nullptr;
+static void *(*old_eti_kis)(void *path) = nullptr;
+
+static void eti_log_path(const char *factory, void *path) {
+    if (path == nullptr) return;
+    int32_t plen = probe_string_length(path);
+    if (plen <= 0 || plen >= 1024) return;
+    std::string p = utf16_to_utf8((const char16_t *)((uintptr_t)path + 0x14), plen);
+    static std::unordered_set<std::string> logged_paths;
+    if (logged_paths.insert(p).second) {
+        LOGI("【eti解密流】%s path=\"%s\"", factory, p.c_str());
+    }
+}
+
+static void eti_dump_result_stream(void *result) {
+    if (result == nullptr) return;
+    void *buf = *(void **)((uintptr_t)result + 0x10);  // MemoryStream._buffer
+    int32_t blen = 0;
+    uint8_t *bd = probe_array_data(buf, &blen);
+    if (bd != nullptr) dump_probe_blob("eti_stream", bd, (size_t)blen);
+}
+
+static void *my_eti_cntj(void *path) { eti_log_path("cntj", path); void *r = old_eti_cntj(path); eti_dump_result_stream(r); return r; }
+static void *my_eti_rw(void *path)   { eti_log_path("rw", path);   void *r = old_eti_rw(path);   eti_dump_result_stream(r); return r; }
+static void *my_eti_cbb(void *path)  { eti_log_path("cbb", path);  void *r = old_eti_cbb(path);  eti_dump_result_stream(r); return r; }
+static void *my_eti_kis(void *path)  { eti_log_path("kis", path);  void *r = old_eti_kis(path);  eti_dump_result_stream(r); return r; }
+
 // ---- 按名查找并安装全部探针（幂等，可随重试循环补装）----
 
 static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
@@ -729,8 +827,9 @@ static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
 }
 
 bool install_table_path_probes() {
-    static bool res_done = false, mp_done = false, clzf_done = false, ta_done = false;
-    if (res_done && mp_done && clzf_done && ta_done) return true;
+    static bool res_done = false, mp_done = false, clzf_done = false, ta_done = false,
+                eti_done = false;
+    if (res_done && mp_done && clzf_done && ta_done && eti_done) return true;
 
     // 1) res 入口（全局命名空间，Trickcal.AllShared）
     if (!res_done) {
@@ -817,7 +916,46 @@ bool install_table_path_probes() {
         }
     }
 
-    return res_done && mp_done && clzf_done && ta_done;
+    // 5) eti 类 AES 解密路径：cntp 密钥派生 + cntj/rw/cbb/kis 解密流工厂
+    if (!eti_done) {
+        Il2CppClass *klass = find_class_in_assemblies("", "eti");
+        if (klass) {
+            bool cntp_ok = false;
+            const MethodInfo *mp = il2cpp_class_get_method_from_name(klass, "cntp", 4);
+            if (mp && mp->methodPointer) {
+                DobbyHook((void *)mp->methodPointer, (void *)my_eti_cntp,
+                          (void **)&old_eti_cntp);
+                cntp_ok = true;
+                LOGI("【探针】eti.cntp 密钥派生已安装");
+            } else {
+                LOGI("【提示】eti.cntp 方法查找失败");
+            }
+            struct EtiEntry { const char *name; void *replace; void **origin; bool ok; };
+            static EtiEntry eti_entries[] = {
+                {"cntj", (void *)my_eti_cntj, (void **)&old_eti_cntj, false},
+                {"rw",   (void *)my_eti_rw,   (void **)&old_eti_rw,   false},
+                {"cbb",  (void *)my_eti_cbb,  (void **)&old_eti_cbb,  false},
+                {"kis",  (void *)my_eti_kis,  (void **)&old_eti_kis,  false},
+            };
+            bool all = true;
+            for (auto &e : eti_entries) {
+                if (e.ok) continue;
+                const MethodInfo *m = il2cpp_class_get_method_from_name(klass, e.name, 1);
+                if (m && m->methodPointer) {
+                    DobbyHook((void *)m->methodPointer, e.replace, e.origin);
+                    e.ok = true;
+                    LOGI("【探针】eti.%s 解密流工厂已安装", e.name);
+                } else {
+                    all = false;
+                }
+            }
+            eti_done = cntp_ok && all;
+        } else {
+            LOGI("【提示】eti 类查找失败（AES 解密路径 hook 未安装）");
+        }
+    }
+
+    return res_done && mp_done && clzf_done && ta_done && eti_done;
 }
 
 // ==================== 主入口 ====================
