@@ -332,6 +332,7 @@ void my_ugi_set_text(void *__this, MyIl2CppString *il2cpp_string) {
 
 bool install_crypto_dumps();      // 前向声明：定义在下方解密 Dump 部分
 bool install_table_path_probes(); // 前向声明：定义在下方表加载路径追踪探针部分
+static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name); // 前向声明：类查找（含枚举回退）
 
 // 通用文本方法查找+hook：在全部程序集中按 命名空间.类名.方法名 查找 1 个 string 参数的方法
 static bool hook_text_method(const char *ns, const char *cls, const char *method_name,
@@ -507,20 +508,12 @@ bool install_crypto_dumps() {
     static bool nrf_done = false, ewel_done = false, lqg_done = false;
     if (nrf_done && ewel_done && lqg_done) return true;
 
-    auto domain = il2cpp_domain_get();
-    if (!domain) return false;
-    size_t assembly_count = 0;
-    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &assembly_count);
-    if (!assemblies || assembly_count == 0) return false;
-
-    for (size_t i = 0; i < assembly_count; i++) {
-        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) continue;
-        // res 类：全局命名空间，位于 Trickcal.AllShared.dll
-        Il2CppClass *klass = il2cpp_class_from_name(image, "", "res");
-        if (!klass) continue;
-
-        LOGI("【解密Dump】找到 res 类，image=%p", image);
+    // res 类：全局命名空间，位于 Trickcal.AllShared.dll。
+    // 注意：本游戏 il2cpp_class_from_name 对空命名空间的混淆类失效，必须走
+    // find_class_in_assemblies（内部含 image 类型枚举回退），否则 res 永远找不到。
+    Il2CppClass *klass = find_class_in_assemblies("", "res");
+    if (klass) {
+        LOGI("【解密Dump】找到 res 类，klass=%p", klass);
         struct { const char *name; void *replace; void **origin; bool *done; } prims[] = {
             {"nrf",  (void *)my_nrf,  (void **)&old_nrf,  &nrf_done},
             {"ewel", (void *)my_ewel, (void **)&old_ewel, &ewel_done},
@@ -553,8 +546,15 @@ bool install_crypto_dumps() {
 
 // IL2CPP 数组布局（64位）：klass@0x00 monitor@0x08 bounds@0x10 length@0x18 data@0x20
 // （bounds 在前，length 在后 —— 写反会把 bounds 指针当长度，全部 dump 静默失效）
+// 托管指针粗检：IL2CPP/GC 堆对象 16 字节对齐、位于高地址用户空间。
+// 防止 hook 到非预期对象（如返回值不是 MemoryStream）时解引用野指针崩溃。
+static bool looks_like_managed_ptr(const void *p) {
+    uintptr_t a = (uintptr_t)p;
+    return a >= 0x10000 && a < 0x80000000000ULL && (a & 0xF) == 0;
+}
+
 static uint8_t *probe_array_data(void *arr, int32_t *out_len) {
-    if (!arr) return nullptr;
+    if (!arr || !looks_like_managed_ptr(arr)) return nullptr;
     void *bounds = *(void **)((uintptr_t)arr + 0x10);
     int32_t len = *(int32_t *)((uintptr_t)arr + 0x18);
     if (bounds != nullptr) return nullptr;  // 多维数组不处理
@@ -564,8 +564,9 @@ static uint8_t *probe_array_data(void *arr, int32_t *out_len) {
 }
 
 static int32_t probe_string_length(void *s) {
-    if (!s) return 0;
-    return *(int32_t *)((uintptr_t)s + 0x10);
+    if (!s || !looks_like_managed_ptr(s)) return 0;
+    int32_t n = *(int32_t *)((uintptr_t)s + 0x10);
+    return (n >= 0 && n < 1024 * 1024) ? n : 0;  // 合理字符串长度上限 1MB
 }
 
 // 带标签的调用栈打印（RVA 相对 libil2cpp.so 基址）
@@ -777,9 +778,11 @@ static void my_eti_cntp(void *alg, void *pw, void **out_key, void **out_iv) {
 }
 
 // eti.cntj/rw/cbb/kis(String) → Stream 解密流工厂
+// eti.cnti(String a, String b, String c) = Path.Combine 包装，最终仍然走解密流（dump.cs 已验证）
 //   File.OpenRead(path) → 读 hlys=160B 头写入 MemoryStream → CryptoStream(其余, 解密器)
 //   → CopyTo 同一 MemoryStream → 返回。返回对象首字段(@0x10) = _buffer byte[]，
 //   内容 = [160B 头][AES 解密后的表数据]
+static void *(*old_eti_cnti)(void *a, void *b, void *c) = nullptr;
 static void *(*old_eti_cntj)(void *path) = nullptr;
 static void *(*old_eti_rw)(void *path) = nullptr;
 static void *(*old_eti_cbb)(void *path) = nullptr;
@@ -796,14 +799,39 @@ static void eti_log_path(const char *factory, void *path) {
     }
 }
 
+static std::string eti_get_string(void *s) {
+    if (s == nullptr) return {};
+    int32_t n = probe_string_length(s);
+    if (n <= 0 || n >= 1024) return {};
+    return utf16_to_utf8((const char16_t *)((uintptr_t)s + 0x14), n);
+}
+
 static void eti_dump_result_stream(void *result) {
-    if (result == nullptr) return;
+    if (!looks_like_managed_ptr(result)) return;
     void *buf = *(void **)((uintptr_t)result + 0x10);  // MemoryStream._buffer
+    if (!looks_like_managed_ptr(buf)) {
+        LOGI("【eti解密流】返回对象 _buffer 指针异常 %p（可能非 MemoryStream，跳过 dump）", buf);
+        return;
+    }
     int32_t blen = 0;
     uint8_t *bd = probe_array_data(buf, &blen);
     if (bd != nullptr) dump_probe_blob("eti_stream", bd, (size_t)blen);
 }
 
+static void *my_eti_cnti(void *a, void *b, void *c) {
+    std::string A = eti_get_string(a), B = eti_get_string(b), C = eti_get_string(c);
+    if (!A.empty() || !B.empty() || !C.empty()) {
+        static std::unordered_map<std::string, bool> seen;
+        std::string key = A + "|" + B + "|" + C;
+        if (seen.find(key) == seen.end()) {
+            seen[key] = true;
+            LOGI("【eti解密流】cnti combine(\"%s\", \"%s\", \"%s\")", A.c_str(), B.c_str(), C.c_str());
+        }
+    }
+    void *r = old_eti_cnti(a, b, c);
+    eti_dump_result_stream(r);
+    return r;
+}
 static void *my_eti_cntj(void *path) { eti_log_path("cntj", path); void *r = old_eti_cntj(path); eti_dump_result_stream(r); return r; }
 static void *my_eti_rw(void *path)   { eti_log_path("rw", path);   void *r = old_eti_rw(path);   eti_dump_result_stream(r); return r; }
 static void *my_eti_cbb(void *path)  { eti_log_path("cbb", path);  void *r = old_eti_cbb(path);  eti_dump_result_stream(r); return r; }
@@ -811,18 +839,103 @@ static void *my_eti_kis(void *path)  { eti_log_path("kis", path);  void *r = old
 
 // ---- 按名查找并安装全部探针（幂等，可随重试循环补装）----
 
+// ---- 类查找：il2cpp_class_from_name 对混淆类失效 + 枚举回退 ----
+// 实测（2026-09-04，libil2cpp.so 反汇编证实）：本游戏 il2cpp_class_from_name
+// 内部在 image+0x30 懒建名称表，查找成功后还要做一轮字符串指针比较校验；
+// 对命名空间为空的混淆类（res/eti）始终返回 null（带命名空间的正常名类
+// 如 CLZF2/TextAsset 不受影响）。回退方案：用 il2cpp_image_get_class 按
+// 类型定义索引枚举 image 内全部类（Zygisk-Il2CppDumper 同款路径），
+// 直接对 klass->name / klass->namespaze 做 strcmp 内容比较。
+typedef size_t (*fn_image_get_class_count)(const void *image);
+typedef void *(*fn_image_get_class)(const void *image, size_t index);
+typedef const char *(*fn_class_get_name)(void *klass);
+typedef const char *(*fn_class_get_namespace)(void *klass);
+
+static fn_image_get_class_count  p_image_get_class_count = nullptr;
+static fn_image_get_class        p_image_get_class       = nullptr;
+static fn_class_get_name         p_class_get_name        = nullptr;
+static fn_class_get_namespace    p_class_get_namespace   = nullptr;
+
+static void enum_lookup_apis_init() {
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
+    void *h = xdl_open("libil2cpp.so", 0);
+    if (!h) { LOGE("【类查找】枚举回退初始化失败：libil2cpp.so 打开失败"); return; }
+    size_t sz = 0;
+    p_image_get_class_count = (fn_image_get_class_count)xdl_sym(h, "il2cpp_image_get_class_count", &sz);
+    p_image_get_class       = (fn_image_get_class)xdl_sym(h, "il2cpp_image_get_class", &sz);
+    p_class_get_name        = (fn_class_get_name)xdl_sym(h, "il2cpp_class_get_name", &sz);
+    p_class_get_namespace   = (fn_class_get_namespace)xdl_sym(h, "il2cpp_class_get_namespace", &sz);
+    if (p_image_get_class_count && p_image_get_class && p_class_get_name)
+        LOGI("【类查找】枚举回退 API 就绪（image_get_class=%p, class_get_name=%p, ns=%p）",
+             p_image_get_class, p_class_get_name, p_class_get_namespace);
+    else
+        LOGE("【类查找】枚举回退 API 解析失败（%p %p %p %p）",
+             p_image_get_class_count, p_image_get_class, p_class_get_name, p_class_get_namespace);
+}
+
+static bool ns_is_empty(const char *s) { return s == nullptr || s[0] == '\0'; }
+
 static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
     auto domain = il2cpp_domain_get();
     if (!domain) return nullptr;
     size_t assembly_count = 0;
     const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &assembly_count);
     if (!assemblies || assembly_count == 0) return nullptr;
+
+    // 1) 快速路径：标准按名查找（带命名空间的类走这里即可命中）
     for (size_t i = 0; i < assembly_count; i++) {
         const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
         if (!image) continue;
         Il2CppClass *klass = il2cpp_class_from_name(image, ns, name);
         if (klass) return klass;
     }
+
+    // 2) 回退路径：逐 image 枚举全部类型定义，直接比较 name/namespace 内容
+    enum_lookup_apis_init();
+    if (!p_image_get_class_count || !p_image_get_class || !p_class_get_name) return nullptr;
+
+    static bool logged_scan = false;
+    Il2CppClass *name_only_match = nullptr;
+    size_t name_only_count = 0;
+    const char *name_only_ns = nullptr;
+
+    for (size_t i = 0; i < assembly_count; i++) {
+        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        size_t cnt = p_image_get_class_count((const void *)image);
+        if (!logged_scan)
+            LOGI("【类查找】枚举 image[%zu] 类型数=%zu（目标 %s.%s）",
+                 i, cnt, (ns && ns[0]) ? ns : "<global>", name);
+        for (size_t j = 0; j < cnt; j++) {
+            Il2CppClass *klass = (Il2CppClass *)p_image_get_class((const void *)image, j);
+            if (!klass) continue;
+            const char *kn = p_class_get_name((void *)klass);
+            if (!kn || strcmp(kn, name) != 0) continue;
+            const char *kns = p_class_get_namespace ? p_class_get_namespace((void *)klass) : nullptr;
+            bool ns_ok = (ns && ns[0]) ? (kns && strcmp(kns, ns) == 0) : ns_is_empty(kns);
+            if (ns_ok) {
+                LOGI("【类查找】%s 通过枚举命中（class_from_name 对该类失效；namespace=\"%s\" image[%zu] idx=%zu）",
+                     name, kns ? kns : "", i, j);
+                return klass;
+            }
+            // 名字命中但命名空间不符：记录候选（应对命名空间被混淆成特殊字节的情况）
+            name_only_count++;
+            if (!name_only_match) { name_only_match = klass; name_only_ns = kns; }
+        }
+    }
+    logged_scan = true;
+
+    // 目标在全局命名空间时，若全部 image 中仅有 1 个同名类，即使命名空间字段
+    // 异常（非空/被混淆）也采用，但打出醒目告警便于日志复核
+    if ((!ns || !ns[0]) && name_only_count == 1 && name_only_match) {
+        LOGI("【类查找】%s 命名空间字段异常但全库唯一同名，采用之（namespace=\"%s\"）",
+             name, name_only_ns ? name_only_ns : "(null)");
+        return name_only_match;
+    }
+    if (name_only_count > 1)
+        LOGE("【类查找】%s 存在 %zu 个同名类但命名空间均不匹配，放弃", name, name_only_count);
     return nullptr;
 }
 
@@ -916,7 +1029,9 @@ bool install_table_path_probes() {
         }
     }
 
-    // 5) eti 类 AES 解密路径：cntp 密钥派生 + cntj/rw/cbb/kis 解密流工厂
+    // 5) eti 类 AES 解密路径：cntp 密钥派生 + cnti(3参)/cntj/rw/cbb/kis 解密流工厂
+    //    - 1 参工厂 cntj/rw/cbb/kis 直接对文件路径解密
+    //    - 3 参工厂 cnti = Path.Combine 包装，剧情表加载也会走它（dump.cs 已验证）
     if (!eti_done) {
         Il2CppClass *klass = find_class_in_assemblies("", "eti");
         if (klass) {
@@ -930,23 +1045,25 @@ bool install_table_path_probes() {
             } else {
                 LOGI("【提示】eti.cntp 方法查找失败");
             }
-            struct EtiEntry { const char *name; void *replace; void **origin; bool ok; };
+            struct EtiEntry { const char *name; int argc; void *replace; void **origin; bool ok; };
             static EtiEntry eti_entries[] = {
-                {"cntj", (void *)my_eti_cntj, (void **)&old_eti_cntj, false},
-                {"rw",   (void *)my_eti_rw,   (void **)&old_eti_rw,   false},
-                {"cbb",  (void *)my_eti_cbb,  (void **)&old_eti_cbb,  false},
-                {"kis",  (void *)my_eti_kis,  (void **)&old_eti_kis,  false},
+                {"cnti", 3, (void *)my_eti_cnti, (void **)&old_eti_cnti, false},
+                {"cntj", 1, (void *)my_eti_cntj, (void **)&old_eti_cntj, false},
+                {"rw",   1, (void *)my_eti_rw,   (void **)&old_eti_rw,   false},
+                {"cbb",  1, (void *)my_eti_cbb,  (void **)&old_eti_cbb,  false},
+                {"kis",  1, (void *)my_eti_kis,  (void **)&old_eti_kis,  false},
             };
             bool all = true;
             for (auto &e : eti_entries) {
                 if (e.ok) continue;
-                const MethodInfo *m = il2cpp_class_get_method_from_name(klass, e.name, 1);
+                const MethodInfo *m = il2cpp_class_get_method_from_name(klass, e.name, e.argc);
                 if (m && m->methodPointer) {
                     DobbyHook((void *)m->methodPointer, e.replace, e.origin);
                     e.ok = true;
-                    LOGI("【探针】eti.%s 解密流工厂已安装", e.name);
+                    LOGI("【探针】eti.%s 解密流工厂已安装（%d参）", e.name, e.argc);
                 } else {
                     all = false;
+                    LOGI("【提示】eti.%s(%d) 方法查找失败", e.name, e.argc);
                 }
             }
             eti_done = cntp_ok && all;
