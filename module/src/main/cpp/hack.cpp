@@ -251,6 +251,37 @@ void preload_captured_texts() {
     LOGI("【去重】预加载了 %d 条已捕获文本，不会重复写入。", count);
 }
 
+// 公共记录：一条韩文原文 → 内存去重 + 追加写 captured_korean.txt（线程安全）。
+// set_text 路径与全量字符串捕获网共用，is_new 时打日志（限流）。
+static bool record_captured_korean(const char16_t *chars, int32_t len, const char *tag) {
+    // len>=1：单音节韩文（네/예/응 等）也是有效文本；>1024 视为非文本载荷跳过
+    if (!chars || len <= 0 || len > 1024) return false;
+    if (!contains_korean(chars, len)) return false;
+    std::string text = utf16_to_utf8(chars, len);
+    bool is_new = false;
+    {
+        std::lock_guard<std::mutex> lk(capture_mutex);
+        is_new = captured_kr_texts.insert(text).second;
+    }
+    if (!is_new) return false;
+    FILE *f = fopen("/sdcard/Download/captured_korean.txt", "a");
+    if (f) {
+        std::string safe = text;
+        size_t p = 0;
+        while ((p = safe.find('\n', p)) != std::string::npos) {
+            safe.replace(p, 1, "\\n");
+            p += 2;
+        }
+        fprintf(f, "%s\n", safe.c_str());
+        fclose(f);
+    }
+    static int total = 0;
+    int n = ++total;
+    if (n <= 100 || n % 500 == 0)
+        LOGI("【%s】#%d %s", tag, n, text.c_str());
+    return true;
+}
+
 // 第一次捕获到韩文时，打印调用栈
 static bool callstack_printed = false;
 
@@ -285,25 +316,7 @@ static void process_and_forward(void *__this, MyIl2CppString *il2cpp_string, set
             }
 
             // 自动收集未翻译的韩文原文（内存 set 去重 + 启动时预加载文件，双重防重复）
-            bool is_new = false;
-            {
-                std::lock_guard<std::mutex> lk(capture_mutex);
-                is_new = captured_kr_texts.insert(original_text).second;
-            }
-            if (is_new) {
-                FILE *f = fopen("/sdcard/Download/captured_korean.txt", "a");
-                if (f) {
-                    std::string safe = original_text;
-                    size_t p = 0;
-                    while ((p = safe.find('\n', p)) != std::string::npos) {
-                        safe.replace(p, 1, "\\n");
-                        p += 2;
-                    }
-                    fprintf(f, "%s\n", safe.c_str());
-                    fclose(f);
-                }
-                LOGI("【文本捕获】%s", original_text.c_str());  // 仅新捕获时打日志，避免刷屏
-            }
+            record_captured_korean(il2cpp_string->chars, il2cpp_string->length, "文本捕获");
         }
 
         // 查字典翻译
@@ -326,6 +339,37 @@ void my_set_text(void *__this, MyIl2CppString *il2cpp_string) {
 // legacy UI.Text 使用自己的替换函数，转发给自己的原函数
 void my_ugi_set_text(void *__this, MyIl2CppString *il2cpp_string) {
     process_and_forward(__this, il2cpp_string, old_ugi_set_text);
+}
+
+// ==================== 全量韩文捕获网（版本无关，2026-09-04）====================
+// 背景：热更新后剧情数据不再经过 TextAsset.bytes / mscorlib 加密通道（原生
+// AssetBundle/热更文件反序列化直接构造托管字符串），按类名找解密器已无意义。
+// 但任何托管字符串最终都要经 il2cpp_string_new / il2cpp_string_new_utf16 创建。
+// 在这里拦一道：凡是含韩文的字符串一律入库 captured_korean.txt，覆盖
+// “已加载但未显示”的文本（未走分支的剧情、全部图鉴/物品/技能描述等），
+// 不依赖任何类名/方法名，游戏再更新也有效。
+using string_new_fn     = MyIl2CppString *(*)(const char *utf8);
+using string_new_u16_fn = MyIl2CppString *(*)(const char16_t *utf16, int32_t len);
+static string_new_fn     old_string_new = nullptr;
+static string_new_u16_fn old_string_new_utf16 = nullptr;
+
+static void net_capture_result(MyIl2CppString *s) {
+    // s 是运行时刚构造返回的字符串对象，null 判断即可；长度字段按
+    // IL2CPP 字符串布局（length@0x10）读取，record 内部另有长度上下限校验
+    if (!s) return;
+    record_captured_korean(s->chars, s->length, "文本网");
+}
+
+static MyIl2CppString *my_string_new(const char *utf8) {
+    MyIl2CppString *r = old_string_new(utf8);
+    net_capture_result(r);
+    return r;
+}
+
+static MyIl2CppString *my_string_new_utf16(const char16_t *utf16, int32_t len) {
+    MyIl2CppString *r = old_string_new_utf16(utf16, len);
+    net_capture_result(r);
+    return r;
 }
 
 // ==================== 按名查找并安装 Hook ====================
@@ -1322,6 +1366,34 @@ void hack_start(const char *game_data_dir) {
             // 一次性任务：加载翻译字典 + 预加载已捕获文本（去重）
             load_translation_dict();
             preload_captured_texts();
+
+            // 全量韩文捕获网：hook 字符串创建 API（版本无关）。
+            // 任何托管字符串（含原生 AssetBundle 反序列化直接构造的）都要经过
+            // 这两个导出函数，韩文一律入库；失败安全，装不上也不影响翻译。
+            {
+                void *p_new = (void *)xdl_sym(handle, "il2cpp_string_new", &sym_size);
+                size_t sym_size2 = 0;
+                void *p_u16 = (void *)xdl_sym(handle, "il2cpp_string_new_utf16", &sym_size2);
+                if (p_new) {
+                    if (DobbyHook(p_new, (void *)my_string_new, (void **)&old_string_new) == 0) {
+                        // 我们自己造中文替换串时直接走 trampoline，跳过本 hook
+                        il2cpp_string_new_ptr = (MyIl2CppString *(*)(const char *))old_string_new;
+                        LOGI("【成功】全量韩文库已安装：il2cpp_string_new @ %p", p_new);
+                    } else {
+                        LOGI("【提示】il2cpp_string_new hook 安装失败，跳过（不影响翻译）");
+                    }
+                } else {
+                    LOGI("【提示】未找到 il2cpp_string_new 导出，全量韩文库跳过");
+                }
+                if (p_u16) {
+                    if (DobbyHook(p_u16, (void *)my_string_new_utf16, (void **)&old_string_new_utf16) == 0)
+                        LOGI("【成功】全量韩文库已安装：il2cpp_string_new_utf16 @ %p", p_u16);
+                    else
+                        LOGI("【提示】il2cpp_string_new_utf16 hook 安装失败，跳过（不影响翻译）");
+                } else {
+                    LOGI("【提示】未找到 il2cpp_string_new_utf16 导出，utf16 捕获跳过");
+                }
+            }
 
             // 立即安装：self-SIGKILL 已被拦截，游戏启动完整性检测的自杀手段失效，
             // 无需再靠 sleep(25) 躲避检测窗口。启动阶段的表解密（kr.client 等）
