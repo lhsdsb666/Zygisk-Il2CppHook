@@ -381,12 +381,15 @@ bool install_hooks_by_name(void *handle) {
     if (!crypto_done)
         crypto_done = install_crypto_dumps();
 
-    // 探针独立于关键 hook：安装失败不阻塞主流程，随重试循环补装
+    // 探针随重试循环补装；框架层 hook（mscorlib 版本无关）就绪即视为解密路径就位
     if (!probe_done)
         probe_done = install_table_path_probes();
 
-    // crypto 依赖 Trickcal.AllShared 程序集就绪，未就绪时随重试循环补装
-    return tmp_done && crypto_done;
+    // 完成条件：UI 文本 hook + 解密路径 hook。解密路径二选一即可：
+    //   crypto_done = 旧版 res XOR dump（依赖混淆类 res，热更新后已失效）
+    //   probe_done  = 框架层加解密 hook（SymmetricAlgorithm/CryptoStream/MemoryStream）
+    // 热更新后 res/eti 混淆类已改名，框架 hook 为当前版本实际主路径。
+    return tmp_done && (crypto_done || probe_done);
 }
 
 // ==================== 剧情表解密 Dump（静态解包辅助）====================
@@ -837,6 +840,117 @@ static void *my_eti_rw(void *path)   { eti_log_path("rw", path);   void *r = old
 static void *my_eti_cbb(void *path)  { eti_log_path("cbb", path);  void *r = old_eti_cbb(path);  eti_dump_result_stream(r); return r; }
 static void *my_eti_kis(void *path)  { eti_log_path("kis", path);  void *r = old_eti_kis(path);  eti_dump_result_stream(r); return r; }
 
+// ---- 框架层加解密 hook（版本无关兜底，2026-09-04 新增）----
+// 游戏热更新后 Assembly-CSharp 混淆类名全部重排（实测：枚举 169 个 image 约 4 万
+// 个类已无 eti/res，运行时 libil2cpp 符号地址与旧版固定偏移 0x331D0）。
+// 但 AES 解密最终必经 mscorlib 框架类，类名永远稳定：
+//   - SymmetricAlgorithm.set_Key / set_IV：直接抓 AES 密钥与 IV（RijndaelManaged
+//     不重写这两个 setter，hook 基类即可全部命中）
+//   - CryptoStream.ctor / Read：Read 返回的 buffer 即【解密后明文分块】
+//   - MemoryStream.ToArray：解密结果 CopyTo 到 MemoryStream 后，游戏取整表时
+//     大概率调用 ToArray()，可一次性拿到【整张表明文】（≥16KB 才落盘）
+static void (*old_sys_set_key)(void *, void *) = nullptr;
+static void (*old_sys_set_iv)(void *, void *) = nullptr;
+static int  (*old_sys_cs_read)(void *, void *, int32_t, int32_t) = nullptr;
+static void (*old_sys_cs_ctor)(void *, void *, void *, int32_t) = nullptr;
+static void *(*old_sys_ms_toarray)(void *) = nullptr;
+
+static void my_sys_set_key(void *thiz, void *arr) {
+    old_sys_set_key(thiz, arr);
+    int32_t n = 0;
+    uint8_t *d = probe_array_data(arr, &n);
+    if (d && n > 0) {
+        dump_probe_blob("sys_key", d, (size_t)n);
+        static std::string last;
+        std::string hx = eti_to_hex(d, n < 64 ? n : 64);
+        if (hx != last) { last = hx; LOGI("【系统加密】SymmetricAlgorithm.set_Key len=%d hex=%s", n, hx.c_str()); }
+    }
+}
+
+static void my_sys_set_iv(void *thiz, void *arr) {
+    old_sys_set_iv(thiz, arr);
+    int32_t n = 0;
+    uint8_t *d = probe_array_data(arr, &n);
+    if (d && n > 0) {
+        dump_probe_blob("sys_iv", d, (size_t)n);
+        static std::string last;
+        std::string hx = eti_to_hex(d, n < 64 ? n : 64);
+        if (hx != last) { last = hx; LOGI("【系统加密】SymmetricAlgorithm.set_IV len=%d hex=%s", n, hx.c_str()); }
+    }
+}
+
+// public override Int32 Read(Byte[] buffer, Int32 offset, Int32 count)
+static int my_sys_cs_read(void *thiz, void *buf, int32_t off, int32_t count) {
+    int r = old_sys_cs_read(thiz, buf, off, count);
+    if (r > 0) {
+        int32_t blen = 0;
+        uint8_t *bd = probe_array_data(buf, &blen);
+        if (bd && off >= 0 && (int64_t)off + r <= blen)
+            dump_probe_blob("sys_plain", bd + off, (size_t)r);  // 解密后明文分块
+    }
+    return r;
+}
+
+// .ctor(Stream stream, ICryptoTransform transform, CryptoStreamMode mode)
+static void my_sys_cs_ctor(void *thiz, void *stream, void *xform, int32_t mode) {
+    old_sys_cs_ctor(thiz, stream, xform, mode);
+    static int n = 0;
+    if (++n <= 20)
+        LOGI("【系统解密流】CryptoStream.ctor #%d mode=%d(0=读/解密 1=写/加密) stream=%p xform=%p",
+             n, mode, stream, xform);
+}
+
+// public virtual Byte[] ToArray()
+static void *my_sys_ms_toarray(void *thiz) {
+    void *arr = old_sys_ms_toarray(thiz);
+    int32_t n = 0;
+    uint8_t *d = probe_array_data(arr, &n);
+    if (d && n >= 16384) {  // 只抓大块：解密后的整张表；UI/临时小对象跳过
+        dump_probe_blob("sys_table", d, (size_t)n);
+        static int cnt = 0;
+        if (++cnt <= 30) LOGI("【系统解密流】MemoryStream.ToArray len=%d（疑似整表明文）", n);
+    }
+    return arr;
+}
+
+// 双保险：RijndaelManaged 重写了 CreateDecryptor(Byte[], Byte[]) / CreateEncryptor，
+// 游戏若直接用 2 参工厂（不先给 Key/IV 属性赋值），set_Key/set_IV 不会触发；
+// 这里直接从工厂参数抓 key/iv。本 hook 为附加项，查找失败不影响主流程。
+static void *(*old_sys_create_dec)(void *, void *, void *) = nullptr;
+static void *(*old_sys_create_enc)(void *, void *, void *) = nullptr;
+
+static void sys_dump_key_iv(const char *via, void *key, void *iv) {
+    int32_t kn = 0, ivn = 0;
+    uint8_t *kd = probe_array_data(key, &kn);
+    uint8_t *id = probe_array_data(iv, &ivn);
+    if (kd && kn > 0) {
+        dump_probe_blob("sys_key", kd, (size_t)kn);
+        static std::string last_k;
+        std::string hx = eti_to_hex(kd, kn < 64 ? kn : 64);
+        if (hx != last_k) { last_k = hx; LOGI("【系统加密】%s key len=%d hex=%s", via, kn, hx.c_str()); }
+    }
+    if (id && ivn > 0) {
+        dump_probe_blob("sys_iv", id, (size_t)ivn);
+        static std::string last_i;
+        std::string hx = eti_to_hex(id, ivn < 64 ? ivn : 64);
+        if (hx != last_i) { last_i = hx; LOGI("【系统加密】%s iv len=%d hex=%s", via, ivn, hx.c_str()); }
+    }
+}
+
+// public override ICryptoTransform CreateDecryptor(Byte[] rgbKey, Byte[] rgbIV)
+static void *my_sys_create_dec(void *thiz, void *key, void *iv) {
+    void *r = old_sys_create_dec(thiz, key, iv);
+    sys_dump_key_iv("RijndaelManaged.CreateDecryptor", key, iv);
+    return r;
+}
+
+// public override ICryptoTransform CreateEncryptor(Byte[] rgbKey, Byte[] rgbIV)
+static void *my_sys_create_enc(void *thiz, void *key, void *iv) {
+    void *r = old_sys_create_enc(thiz, key, iv);
+    sys_dump_key_iv("RijndaelManaged.CreateEncryptor", key, iv);
+    return r;
+}
+
 // ---- 按名查找并安装全部探针（幂等，可随重试循环补装）----
 
 // ---- 类查找：il2cpp_class_from_name 对混淆类失效 + 枚举回退 ----
@@ -877,6 +991,12 @@ static void enum_lookup_apis_init() {
 
 static bool ns_is_empty(const char *s) { return s == nullptr || s[0] == '\0'; }
 
+// 类查找负缓存：全库枚举（169 image 约 4 万类）单次约 0.3s，重试循环里对
+// 已确认不存在的名字（热更新后改名的 res/eti）反复枚举纯属浪费。
+// 负缓存只作用于【枚举回退】路径；标准 class_from_name 快速路径每次仍执行，
+// 后加载程序集中新出现的类（走快速路径即可命中的框架/带命名空间类）不受影响。
+static std::unordered_set<std::string> g_class_lookup_negative;
+
 static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
     auto domain = il2cpp_domain_get();
     if (!domain) return nullptr;
@@ -895,6 +1015,10 @@ static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
     // 2) 回退路径：逐 image 枚举全部类型定义，直接比较 name/namespace 内容
     enum_lookup_apis_init();
     if (!p_image_get_class_count || !p_image_get_class || !p_class_get_name) return nullptr;
+
+    // 负缓存：此前已全库枚举确认不存在的名字，跳过昂贵枚举
+    std::string neg_key = std::string(ns ? ns : "") + "|" + name;
+    if (g_class_lookup_negative.count(neg_key)) return nullptr;
 
     static bool logged_scan = false;
     Il2CppClass *name_only_match = nullptr;
@@ -936,13 +1060,16 @@ static Il2CppClass *find_class_in_assemblies(const char *ns, const char *name) {
     }
     if (name_only_count > 1)
         LOGE("【类查找】%s 存在 %zu 个同名类但命名空间均不匹配，放弃", name, name_only_count);
+    g_class_lookup_negative.insert(neg_key);  // 全库枚举未命中：负缓存，后续重试直接跳过
     return nullptr;
 }
 
 bool install_table_path_probes() {
     static bool res_done = false, mp_done = false, clzf_done = false, ta_done = false,
-                eti_done = false;
-    if (res_done && mp_done && clzf_done && ta_done && eti_done) return true;
+                eti_done = false, sys_done = false;
+    // 框架层 hook（mscorlib，类名永不混淆）是版本无关主路径，就绪即视为完成；
+    // res/eti 为旧版混淆类名，热更新后已不存在，不再作为完成条件
+    if (sys_done) return true;
 
     // 1) res 入口（全局命名空间，Trickcal.AllShared）
     if (!res_done) {
@@ -1072,7 +1199,94 @@ bool install_table_path_probes() {
         }
     }
 
-    return res_done && mp_done && clzf_done && ta_done && eti_done;
+    // 6) 框架层加解密 hook（版本无关主路径，2026-09-04）
+    //    游戏热更新后 Assembly-CSharp 混淆类名全部重排（枚举 169 image 约 4 万
+    //    类已无 eti/res），但 AES 解密最终必经 mscorlib 框架类，类名永不混淆：
+    //    - SymmetricAlgorithm.set_Key/set_IV：抓 AES 密钥/IV。RijndaelManaged
+    //      不重写这两个 setter（无参 CreateDecryptor 路径必经属性赋值），
+    //      hook 基类即命中全部对称算法实例
+    //    - RijndaelManaged.CreateDecryptor/CreateEncryptor(2参)：双保险，
+    //      直接从工厂参数抓 key/iv（附加项，查找失败不阻塞）
+    //    - CryptoStream..ctor(3参)/Read(3参)：Read 返回 buffer 即解密明文分块
+    //    - MemoryStream.ToArray(0参)：解密 CopyTo 后取整表，≥16KB 才落盘
+    if (!sys_done) {
+        bool sys_ok = true;
+
+        Il2CppClass *sa = find_class_in_assemblies("System.Security.Cryptography",
+                                                   "SymmetricAlgorithm");
+        if (sa) {
+            const MethodInfo *mk = il2cpp_class_get_method_from_name(sa, "set_Key", 1);
+            if (mk && mk->methodPointer) {
+                DobbyHook((void *)mk->methodPointer, (void *)my_sys_set_key,
+                          (void **)&old_sys_set_key);
+                LOGI("【探针】SymmetricAlgorithm.set_Key 已安装（地址 %p）", mk->methodPointer);
+            } else { sys_ok = false; LOGI("【提示】SymmetricAlgorithm.set_Key 查找失败"); }
+
+            const MethodInfo *miv = il2cpp_class_get_method_from_name(sa, "set_IV", 1);
+            if (miv && miv->methodPointer) {
+                DobbyHook((void *)miv->methodPointer, (void *)my_sys_set_iv,
+                          (void **)&old_sys_set_iv);
+                LOGI("【探针】SymmetricAlgorithm.set_IV 已安装（地址 %p）", miv->methodPointer);
+            } else { sys_ok = false; LOGI("【提示】SymmetricAlgorithm.set_IV 查找失败"); }
+        } else { sys_ok = false; LOGI("【提示】SymmetricAlgorithm 类查找失败"); }
+
+        Il2CppClass *csk = find_class_in_assemblies("System.Security.Cryptography",
+                                                    "CryptoStream");
+        if (csk) {
+            const MethodInfo *mc = il2cpp_class_get_method_from_name(csk, ".ctor", 3);
+            if (mc && mc->methodPointer) {
+                DobbyHook((void *)mc->methodPointer, (void *)my_sys_cs_ctor,
+                          (void **)&old_sys_cs_ctor);
+                LOGI("【探针】CryptoStream..ctor(3参) 已安装（地址 %p）", mc->methodPointer);
+            } else { sys_ok = false; LOGI("【提示】CryptoStream..ctor(3参) 查找失败"); }
+
+            const MethodInfo *mr = il2cpp_class_get_method_from_name(csk, "Read", 3);
+            if (mr && mr->methodPointer) {
+                DobbyHook((void *)mr->methodPointer, (void *)my_sys_cs_read,
+                          (void **)&old_sys_cs_read);
+                LOGI("【探针】CryptoStream.Read(3参) 已安装（地址 %p）", mr->methodPointer);
+            } else { sys_ok = false; LOGI("【提示】CryptoStream.Read(3参) 查找失败"); }
+        } else { sys_ok = false; LOGI("【提示】CryptoStream 类查找失败"); }
+
+        Il2CppClass *ms = find_class_in_assemblies("System.IO", "MemoryStream");
+        if (ms) {
+            const MethodInfo *mt = il2cpp_class_get_method_from_name(ms, "ToArray", 0);
+            if (mt && mt->methodPointer) {
+                DobbyHook((void *)mt->methodPointer, (void *)my_sys_ms_toarray,
+                          (void **)&old_sys_ms_toarray);
+                LOGI("【探针】MemoryStream.ToArray 已安装（地址 %p）", mt->methodPointer);
+            } else { sys_ok = false; LOGI("【提示】MemoryStream.ToArray 查找失败"); }
+        } else { sys_ok = false; LOGI("【提示】MemoryStream 类查找失败"); }
+
+        // 附加双保险：RijndaelManaged 的 2 参加解密工厂（不存在/未重写则跳过，
+        // 不影响 sys_ok——基类 SymmetricAlgorithm 的 2 参工厂内部会调 setter）
+        Il2CppClass *rm = find_class_in_assemblies("System.Security.Cryptography",
+                                                   "RijndaelManaged");
+        if (rm) {
+            const MethodInfo *md = il2cpp_class_get_method_from_name(rm, "CreateDecryptor", 2);
+            if (md && md->methodPointer) {
+                DobbyHook((void *)md->methodPointer, (void *)my_sys_create_dec,
+                          (void **)&old_sys_create_dec);
+                LOGI("【探针】RijndaelManaged.CreateDecryptor(2参) 已安装（地址 %p）", md->methodPointer);
+            } else {
+                LOGI("【提示】RijndaelManaged.CreateDecryptor(2参) 未找到（依赖 set_Key 路径）");
+            }
+            const MethodInfo *me = il2cpp_class_get_method_from_name(rm, "CreateEncryptor", 2);
+            if (me && me->methodPointer) {
+                DobbyHook((void *)me->methodPointer, (void *)my_sys_create_enc,
+                          (void **)&old_sys_create_enc);
+                LOGI("【探针】RijndaelManaged.CreateEncryptor(2参) 已安装（地址 %p）", me->methodPointer);
+            }
+        } else {
+            LOGI("【提示】RijndaelManaged 类未找到（依赖 set_Key/set_IV 路径抓密钥）");
+        }
+
+        sys_done = sys_ok;
+        if (sys_done)
+            LOGI("【探针】框架层加解密 hook 安装完成（set_Key/set_IV/CryptoStream/MemoryStream 已就位）");
+    }
+
+    return sys_done;
 }
 
 // ==================== 主入口 ====================
