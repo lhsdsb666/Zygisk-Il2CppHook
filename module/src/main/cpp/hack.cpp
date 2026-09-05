@@ -428,37 +428,41 @@ static void net_capture_result(MyIl2CppString *s) {
     record_captured_korean(s->chars, s->length, "文本网");
 }
 
+// 帧指针走链打印调用栈（MuMu/libhoudini 上 __builtin_return_address 不可靠，
+// 但帧指针走链方式经实测有效——见 set_text 的【调用栈】日志）
+static void log_callstack_for_capture(const char *tag) {
+    static int caller_cnt = 0;
+    if (caller_cnt >= 50) return;
+    caller_cnt++;
+    uintptr_t base = get_module_base("libil2cpp.so");
+    void **fp = (void **)__builtin_frame_address(0);
+    LOGI("【%s 调用链】==================", tag);
+    if (g_current_invoke)
+        LOGI("【%s invoke方法】%s", tag, g_current_invoke);
+    for (int i = 0; i < 10 && fp != nullptr; i++) {
+        uintptr_t ra = (uintptr_t)(*(fp + 1));
+        if (ra > base)
+            LOGI("【%s 栈%02d】RVA 0x%lx", tag, i,
+                 (unsigned long)(ra - base));
+        void **next = (void **)(*fp);
+        if (next <= fp) break;
+        fp = next;
+    }
+    LOGI("【%s 调用链】==================", tag);
+}
+
 static MyIl2CppString *my_string_new(const char *utf8) {
     MyIl2CppString *r = old_string_new(utf8);
-    // 前 20 条韩文捕获同时打印调用者 RVA，辅助定位剧情数据加载函数
-    if (r && r->length > 0 && contains_korean(r->chars, r->length)) {
-        static int caller_cnt = 0;
-        if (caller_cnt < 20) {
-            caller_cnt++;
-            uintptr_t base = get_module_base("libil2cpp.so");
-            void *ra = __builtin_return_address(0);
-            if ((uintptr_t)ra > base)
-                LOGI("【调用源】string_new caller RVA 0x%lx",
-                     (unsigned long)((uintptr_t)ra - base));
-        }
-    }
+    if (r && r->length > 0 && contains_korean(r->chars, r->length))
+        log_callstack_for_capture("文本网");
     net_capture_result(r);
     return r;
 }
 
 static MyIl2CppString *my_string_new_utf16(const char16_t *utf16, int32_t len) {
     MyIl2CppString *r = old_string_new_utf16(utf16, len);
-    if (r && r->length > 0 && contains_korean(r->chars, r->length)) {
-        static int caller_cnt = 0;
-        if (caller_cnt < 20) {
-            caller_cnt++;
-            uintptr_t base = get_module_base("libil2cpp.so");
-            void *ra = __builtin_return_address(0);
-            if ((uintptr_t)ra > base)
-                LOGI("【调用源】string_new_utf16 caller RVA 0x%lx",
-                     (unsigned long)((uintptr_t)ra - base));
-        }
-    }
+    if (r && r->length > 0 && contains_korean(r->chars, r->length))
+        log_callstack_for_capture("文本网u16");
     net_capture_result(r);
     return r;
 }
@@ -480,32 +484,40 @@ static std::mutex           g_invoke_mutex;
 static int g_invoke_total  = 0;
 static int g_invoke_unique = 0;
 static time_t g_invoke_last_log = 0;
+// 线程局部：当前正在执行的 invoke 方法名，供 string_new 钩子读取
+// 当 string_new 在 runtime_invoke 内部被调用时，能知道是哪个方法触发的
+static thread_local const char *g_current_invoke = nullptr;
 
 static void *my_runtime_invoke(const void *method, void *object,
                                void **params, void **exc) {
-    // 先调原函数——游戏逻辑永远不受影响
+    // 在调原函数之前记录方法名，因为 string_new 会在原函数内部被调用
+    const char *name = nullptr;
+    if (il2cpp_method_get_name_ptr && method) {
+        name = il2cpp_method_get_name_ptr(method);
+        g_current_invoke = name;
+    }
+
     void *result = old_runtime_invoke
                        ? old_runtime_invoke(method, object, params, exc)
                        : nullptr;
+    g_current_invoke = nullptr;
 
-    if (il2cpp_method_get_name_ptr && method) {
-        const char *name = il2cpp_method_get_name_ptr(method);
-        if (name) {
-            g_invoke_total++;
-            bool is_new = false;
-            {
-                std::lock_guard<std::mutex> lk(g_invoke_mutex);
-                is_new = g_invoke_seen.insert(std::string(name)).second;
-                if (is_new) g_invoke_unique++;
-            }
-            if (is_new && g_invoke_unique <= 500)
-                LOGI("【invoke】#%d %s", g_invoke_unique, name);
-            time_t now = time(nullptr);
-            if (now - g_invoke_last_log >= 30) {
-                LOGI("【invoke心跳】总调用 %d 次，唯一方法 %d 个",
-                     g_invoke_total, g_invoke_unique);
-                g_invoke_last_log = now;
-            }
+    if (name) {
+        g_invoke_total++;
+        bool is_new = false;
+        {
+            std::lock_guard<std::mutex> lk(g_invoke_mutex);
+            is_new = g_invoke_seen.insert(std::string(name)).second;
+            if (is_new) g_invoke_unique++;
+        }
+        // 不再限制上限：剧情播放期间新增的方法名才是关键，不能被启动期的 500 个挤掉
+        if (is_new)
+            LOGI("【invoke】#%d %s", g_invoke_unique, name);
+        time_t now = time(nullptr);
+        if (now - g_invoke_last_log >= 30) {
+            LOGI("【invoke心跳】总调用 %d 次，唯一方法 %d 个",
+                 g_invoke_total, g_invoke_unique);
+            g_invoke_last_log = now;
         }
     }
     return result;
