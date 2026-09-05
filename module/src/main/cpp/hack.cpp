@@ -428,6 +428,11 @@ static void net_capture_result(MyIl2CppString *s) {
     record_captured_korean(s->chars, s->length, "文本网");
 }
 
+// 线程局部：当前正在执行的 invoke 方法名（声明在靠前位置，因 string_new
+// 钩子的调用链打印需要引用它），供 string_new 钩子读取——当 string_new 在
+// runtime_invoke 内部被调用时，能知道是哪个方法触发的
+static thread_local const char *g_current_invoke = nullptr;
+
 // 帧指针走链打印调用栈（MuMu/libhoudini 上 __builtin_return_address 不可靠，
 // 但帧指针走链方式经实测有效——见 set_text 的【调用栈】日志）
 static void log_callstack_for_capture(const char *tag) {
@@ -484,9 +489,6 @@ static std::mutex           g_invoke_mutex;
 static int g_invoke_total  = 0;
 static int g_invoke_unique = 0;
 static time_t g_invoke_last_log = 0;
-// 线程局部：当前正在执行的 invoke 方法名，供 string_new 钩子读取
-// 当 string_new 在 runtime_invoke 内部被调用时，能知道是哪个方法触发的
-static thread_local const char *g_current_invoke = nullptr;
 
 static void *my_runtime_invoke(const void *method, void *object,
                                void **params, void **exc) {
