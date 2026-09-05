@@ -51,6 +51,17 @@
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
+// ==================== 自动日志落盘 ====================
+// hack_start 末尾启动一个后台线程跑 `logcat`，把本模块日志（tag=chopperhl）
+// 自动写入 /sdcard/Download/chopperhl_log.txt，用户无需手动 adb logcat。
+static void start_auto_logcat() {
+    std::thread([]{
+        // 先清空旧日志，再开始持续抓取（阻塞式，线程随进程生命周期存活）
+        system("logcat -c");
+        system("logcat -v time chopperhl:v *:F -f /sdcard/Download/chopperhl_log.txt");
+    }).detach();
+}
+
 // ==================== il2cpp API 外部声明（定义在 il2cpp_dump.cpp，由 il2cpp_api_init 初始化）====================
 extern Il2CppDomain *(*il2cpp_domain_get)();
 extern const Il2CppAssembly **(*il2cpp_domain_get_assemblies)(const Il2CppDomain *, size_t *);
@@ -260,20 +271,26 @@ static bool record_captured_korean(const char16_t *chars, int32_t len, const cha
     }
     static int total = 0;
     int n = ++total;
-    // 日志策略：#1~#100 逐条；之后每 30 秒打一次心跳汇总（仅在有新增时），
-    // 避免长时间静默让人无法区分"没捕获到"与"捕获正常但都被去重"。
+    // 日志策略：#1~#20 逐条（足够看到启动期活动）；之后每 30 秒打一次心跳
+    // 汇总（仅在有新增时触发），每 500 条打里程碑。避免长时间静默让人无法
+    // 区分"没捕获到"与"捕获正常但都被去重"。
     static int last_beat_total = 0;
-    static time_t last_beat_time = 0;
+    static time_t last_log_time = 0;
     time_t now = time(nullptr);
-    if (n <= 100) {
+    if (n <= 20) {
         LOGI("【%s】#%d %s", tag, n, text.c_str());
-    } else if (now - last_beat_time >= 30) {
-        LOGI("【%s心跳】累计新增 %d 条（近30秒 +%d）", tag, n, n - last_beat_total);
+        last_log_time = now;
         last_beat_total = n;
-        last_beat_time = now;
     } else if (n % 500 == 0) {
         LOGI("【%s】#%d %s", tag, n, text.c_str());
+        last_log_time = now;
+        last_beat_total = n;
+    } else if (now - last_log_time >= 30) {
+        LOGI("【%s心跳】累计新增 %d 条（近30秒 +%d）", tag, n, n - last_beat_total);
+        last_beat_total = n;
+        last_log_time = now;
     }
+    // else: 30 秒内已有日志输出且非里程碑，静默避免刷屏
     return true;
 }
 
@@ -548,6 +565,11 @@ void hack_start(const char *game_data_dir) {
             }
             if (!hooked)
                 LOGE("【错误】多次重试后仍未完成 hook 安装。");
+
+            // 启动自动日志落盘：logcat 后台线程把 chopperhl 标签日志写入
+            // /sdcard/Download/chopperhl_log.txt，用户无需手动 adb logcat。
+            start_auto_logcat();
+            LOGI("【成功】自动日志已启动，写入 /sdcard/Download/chopperhl_log.txt");
 
             break;
         }
