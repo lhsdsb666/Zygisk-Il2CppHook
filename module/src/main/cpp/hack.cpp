@@ -544,13 +544,14 @@ static void scan_memory_for_korean(const char *why) {
     int regions = 0, fresh_total = 0;
     size_t scanned = 0, next_progress = 512ull << 20;
     while (fgets(line, sizeof(line), mf)) {
-        uintptr_t start = 0, end = 0;
+        // 32/64 位通吃：用 unsigned long long 中转（%llx），再转 uintptr_t
+        unsigned long long s_ = 0, e_ = 0, inode = 0;
         char perms[8] = {0};
-        unsigned long inode = 0;
         int po = -1;
         // 格式：start-end perms offset dev inode [path]
-        if (sscanf(line, "%lx-%lx %4s %*s %*s %lu %n",
-                   &start, &end, perms, &inode, &po) < 4) continue;
+        if (sscanf(line, "%llx-%llx %4s %*s %*s %llu %n",
+                   &s_, &e_, perms, &inode, &po) < 4) continue;
+        uintptr_t start = (uintptr_t)s_, end = (uintptr_t)e_;
         if (end <= start) continue;
         size_t len = end - start;
         if (len < 4096 || len > (1ull << 30)) continue;         // 跳过 <4KB / >1GB
