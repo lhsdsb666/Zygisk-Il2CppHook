@@ -1,16 +1,22 @@
 // Created by Perfare on 2020/7/4.
-// Trickcal Revive 汉化模块（重构维护版，2026-09-04 精简）
+// Trickcal Revive 汉化模块（重构维护版，2026-09-05）
 //
-// 当前只保留三条活路径（实验性解密 dump / 加解密探针 / 枚举类查找已全部删除：
-// 热更新后剧情装载原生侧化，托管层加解密探针实测全程零触发，留着只增崩溃面）：
+// 当前活路径（实验性解密 dump / 加解密探针 / 枚举类查找已删除：热更新后剧情
+// 装载原生侧化，托管层加解密探针实测全程零触发，留着只增崩溃面）：
 //   1. 文本翻译：按名 hook TMPro.TMP_Text.set_text 与 UnityEngine.UI.Text.set_text
 //      （il2cpp_class_from_name 按名查找，不硬编码 RVA，游戏更新零维护），
 //      查 string_data.txt 字典把韩文替换为中文。
-//   2. 韩文采集：set_text 钩子 + il2cpp_string_new / il2cpp_string_new_utf16
+//   2. 韩文采集（增量）：set_text 钩子 + il2cpp_string_new / il2cpp_string_new_utf16
 //      全量捕获网。任何托管字符串（含原生 AssetBundle 反序列化直接构造的）
 //      创建时若含谚文，一律去重落盘 captured_korean.txt，供离线批量翻译。
 //      注意：hook 的是导出跳板解析出的【真实实现】，见 resolve_thunk_target()。
-//   3. 防自杀：hook exit/_exit/kill/tgkill，拦截启动完整性检测的自毁。
+//   3. 韩文采集（全量主力）：原生内存韩文扫描。剧场实测证明剧情文本由 AOT
+//      代码在显示瞬间才构造（runtime_invoke 零新增、调用链在 libhoudini 下
+//      不可靠），但文本数据加载后常驻本进程内存——直接扫可写映射提取谚文
+//      UTF-8 序列，一次拿全（含未显示分支）。90 秒自动扫大厅 + scan_now
+//      触发文件随时补扫。
+//   4. 防自杀：hook exit/_exit/kill/tgkill，拦截启动完整性检测的自毁。
+//   5. 诊断：runtime_invoke 监控（唯一方法名去重日志，定位反射路径调用）。
 //
 // 血的教训：Dobby arm64 内联补丁占 16 字节。il2cpp 导出常是 4~8 字节 B/BL 跳板
 //   且彼此相邻（实测 string_new 与 _utf16 相隔仅 8 字节），直接对导出地址
@@ -267,28 +273,38 @@ void preload_captured_texts() {
 
 // 公共记录：一条韩文原文 → 内存去重 + 追加写 captured_korean.txt（线程安全）。
 // set_text 路径与全量字符串捕获网共用，is_new 时打日志（限流）。
+// 去重核心（UTF-8 输入），供本函数与内存扫描共用。
+static bool record_korean_utf8(const std::string &text) {
+    if (text.size() < 3 || text.size() > 4096) return false;
+    std::lock_guard<std::mutex> lk(capture_mutex);
+    return captured_kr_texts.insert(text).second;
+}
+
+// 追加写入一条捕获记录（换行转义为字面 \n）。batch 为空则逐条开关文件。
+static void write_captured_line(const std::string &text, FILE *batch) {
+    std::string safe = text;
+    size_t p = 0;
+    while ((p = safe.find('\n', p)) != std::string::npos) {
+        safe.replace(p, 1, "\\n");
+        p += 2;
+    }
+    std::lock_guard<std::mutex> lk(capture_mutex);
+    if (batch) {
+        fprintf(batch, "%s\n", safe.c_str());
+    } else {
+        FILE *f = fopen("/sdcard/Download/captured_korean.txt", "a");
+        if (f) { fprintf(f, "%s\n", safe.c_str()); fclose(f); }
+    }
+}
+
 static bool record_captured_korean(const char16_t *chars, int32_t len, const char *tag) {
     // len>=1：单音节韩文（네/예/응 等）也是有效文本；>1024 视为非文本载荷跳过
     if (!chars || len <= 0 || len > 1024) return false;
     if (!contains_korean(chars, len)) return false;
     std::string text = utf16_to_utf8(chars, len);
-    bool is_new = false;
-    {
-        std::lock_guard<std::mutex> lk(capture_mutex);
-        is_new = captured_kr_texts.insert(text).second;
-    }
+    bool is_new = record_korean_utf8(text);
     if (!is_new) return false;
-    FILE *f = fopen("/sdcard/Download/captured_korean.txt", "a");
-    if (f) {
-        std::string safe = text;
-        size_t p = 0;
-        while ((p = safe.find('\n', p)) != std::string::npos) {
-            safe.replace(p, 1, "\\n");
-            p += 2;
-        }
-        fprintf(f, "%s\n", safe.c_str());
-        fclose(f);
-    }
+    write_captured_line(text, nullptr);
     static int total = 0;
     int n = ++total;
     // 日志策略：#1~#20 逐条（足够看到启动期活动）；之后每 30 秒打一次心跳
@@ -428,48 +444,158 @@ static void net_capture_result(MyIl2CppString *s) {
     record_captured_korean(s->chars, s->length, "文本网");
 }
 
-// 线程局部：当前正在执行的 invoke 方法名（声明在靠前位置，因 string_new
-// 钩子的调用链打印需要引用它），供 string_new 钩子读取——当 string_new 在
-// runtime_invoke 内部被调用时，能知道是哪个方法触发的
+// 线程局部：当前正在执行的 invoke 方法名（诊断用途，配合 invoke 日志排查
+// 哪些调用经反射路径；已证实剧情文本构造不经此路径）
 static thread_local const char *g_current_invoke = nullptr;
 
-// 帧指针走链打印调用栈（MuMu/libhoudini 上 __builtin_return_address 不可靠，
-// 但帧指针走链方式经实测有效——见 set_text 的【调用栈】日志）
-static void log_callstack_for_capture(const char *tag) {
-    static int caller_cnt = 0;
-    if (caller_cnt >= 50) return;
-    caller_cnt++;
-    uintptr_t base = get_module_base("libil2cpp.so");
-    void **fp = (void **)__builtin_frame_address(0);
-    LOGI("【%s 调用链】==================", tag);
-    if (g_current_invoke)
-        LOGI("【%s invoke方法】%s", tag, g_current_invoke);
-    for (int i = 0; i < 10 && fp != nullptr; i++) {
-        uintptr_t ra = (uintptr_t)(*(fp + 1));
-        if (ra > base)
-            LOGI("【%s 栈%02d】RVA 0x%lx", tag, i,
-                 (unsigned long)(ra - base));
-        void **next = (void **)(*fp);
-        if (next <= fp) break;
-        fp = next;
-    }
-    LOGI("【%s 调用链】==================", tag);
-}
+// 帧指针走链调用栈在 string_new 钩子上实测输出垃圾（libhoudini 翻译层下
+// FP 链不可靠，RVA 恒为同一值），已于 2026-09-05 移除；invoke 关联同样
+// 证实剧情构造不走 runtime_invoke。定位职责已由【原生内存韩文扫描】接管。
 
 static MyIl2CppString *my_string_new(const char *utf8) {
     MyIl2CppString *r = old_string_new(utf8);
-    if (r && r->length > 0 && contains_korean(r->chars, r->length))
-        log_callstack_for_capture("文本网");
     net_capture_result(r);
     return r;
 }
 
 static MyIl2CppString *my_string_new_utf16(const char16_t *utf16, int32_t len) {
     MyIl2CppString *r = old_string_new_utf16(utf16, len);
-    if (r && r->length > 0 && contains_korean(r->chars, r->length))
-        log_callstack_for_capture("文本网u16");
     net_capture_result(r);
     return r;
+}
+
+// ==================== 原生内存韩文扫描（全量文本采集，2026-09-05）====================
+// 剧场定位结论：剧情对白由 AOT 代码在【显示瞬间】才经 il2cpp_string_new 构造
+// （播放全程 runtime_invoke 唯一方法零新增），逐行捕获必须逐句观看；但大厅
+// 启动期数百个混淆协程批量装载数据表，剧情/图鉴/技能等文本作为原生 UTF-8
+// 字节常驻本进程堆/匿名映射中。直接扫描自身可写内存提取谚文序列，可一次性
+// 拿到全部已加载文本（含未显示分支），版本无关、只读零风险、不依赖任何符号。
+// 触发：hack 完成后 90 秒自动扫一次（大厅表装载完毕）；之后每 5 秒检查
+// /sdcard/Download/scan_now 触发文件（存在即扫描并删除）——用户在共享目录
+// 新建该空文件即可随时触发（如进入某集剧情后扫一次拿全分支脚本）。
+
+// UTF-8 解码一个码点；返回字节数，非法返回 0
+static int utf8_decode_one(const uint8_t *p, const uint8_t *e, uint32_t &cp) {
+    if (p >= e) return 0;
+    uint8_t b = p[0];
+    if (b < 0x80) { cp = b; return 1; }
+    int n; uint32_t v;
+    if      ((b & 0xE0) == 0xC0) { n = 2; v = b & 0x1F; }
+    else if ((b & 0xF0) == 0xE0) { n = 3; v = b & 0x0F; }
+    else if ((b & 0xF8) == 0xF0) { n = 4; v = b & 0x07; }
+    else return 0;
+    if (p + n > e) return 0;
+    for (int k = 1; k < n; k++) {
+        if ((p[k] & 0xC0) != 0x80) return 0;
+        v = (v << 6) | (p[k] & 0x3F);
+    }
+    if ((n == 2 && v < 0x80) || (n == 3 && v < 0x800) || (n == 4 && v < 0x10000)) return 0;
+    if (v > 0x10FFFF) return 0;
+    cp = v;
+    return n;
+}
+
+static bool is_hangul_syllable(uint32_t cp) { return cp >= 0xAC00 && cp <= 0xD7A3; }
+// run 内允许的字符：可打印 ASCII + 任意有效 UTF-8（控制字符/DEL 断开 run）
+static bool is_run_char(uint32_t cp) { return cp >= 0x20 && cp != 0x7F; }
+
+// 扫描一段内存，提取含 ≥2 个谚文音节的文本 run
+static void scan_region_for_korean(const uint8_t *p, size_t len,
+                                   int &fresh, FILE *batch) {
+    const uint8_t *q = p, *e = p + len;
+    std::string run;
+    run.reserve(256);
+    int hangul = 0;
+    auto flush = [&]() {
+        if (hangul >= 2 && run.size() >= 3 && run.size() <= 4096) {
+            // 去首尾空白
+            size_t b = 0, t = run.size();
+            while (b < t && (run[b] == ' ' || run[b] == '\t')) b++;
+            while (t > b && (run[t-1] == ' ' || run[t-1] == '\t')) t--;
+            std::string text = run.substr(b, t - b);
+            if (text.size() >= 3 && record_korean_utf8(text)) {
+                fresh++;
+                write_captured_line(text, batch);
+            }
+        }
+        run.clear();
+        hangul = 0;
+    };
+    while (q < e) {
+        uint32_t cp;
+        int n = utf8_decode_one(q, e, cp);
+        if (n == 0 || !is_run_char(cp)) { flush(); q += (n == 0 ? 1 : n); continue; }
+        if (is_hangul_syllable(cp)) hangul++;
+        run.append((const char *)q, n);
+        if (run.size() > 4096) flush();
+        q += n;
+    }
+    flush();
+}
+
+static void scan_memory_for_korean(const char *why) {
+    LOGI("【内存扫描】开始（%s）...", why);
+    FILE *mf = fopen("/proc/self/maps", "r");
+    if (!mf) { LOGI("【内存扫描】无法打开 /proc/self/maps，放弃"); return; }
+    FILE *batch = fopen("/sdcard/Download/captured_korean.txt", "a");
+    if (!batch) { fclose(mf); LOGI("【内存扫描】无法打开输出文件，放弃"); return; }
+
+    char line[1024];
+    int regions = 0, fresh_total = 0;
+    size_t scanned = 0, next_progress = 512ull << 20;
+    while (fgets(line, sizeof(line), mf)) {
+        uintptr_t start = 0, end = 0;
+        char perms[8] = {0};
+        unsigned long inode = 0;
+        int po = -1;
+        // 格式：start-end perms offset dev inode [path]
+        if (sscanf(line, "%lx-%lx %4s %*s %*s %lu %n",
+                   &start, &end, perms, &inode, &po) < 4) continue;
+        if (end <= start) continue;
+        size_t len = end - start;
+        if (len < 4096 || len > (1ull << 30)) continue;         // 跳过 <4KB / >1GB
+        if (perms[0] != 'r' || perms[1] != 'w') continue;        // 只扫可写私有（堆/匿名/数据）
+
+        // 路径判定：po 之后非空白 = 文件映射；只关心游戏数据文件
+        bool has_path = false;
+        if (po > 0 && po < (int)sizeof(line)) {
+            const char *path = line + po;
+            while (*path == ' ') path++;
+            has_path = (*path != '\0' && *path != '\n');
+            if (has_path && !strstr(path, "epidgames")) continue; // 排除系统库等文件映射
+        }
+        // 无路径的匿名 rw 映射 + 游戏数据文件映射都扫
+
+        regions++;
+        scan_region_for_korean((const uint8_t *)start, len, fresh_total, batch);
+        scanned += len;
+        if (scanned >= next_progress) {
+            LOGI("【内存扫描】进度 %zu MB，当前新增 %d 条", scanned >> 20, fresh_total);
+            next_progress += 512ull << 20;
+        }
+    }
+    fclose(batch);
+    fclose(mf);
+    LOGI("【内存扫描】完成（%s）：区域 %d 个，扫描 %zu MB，新增 %d 条韩文",
+         why, regions, scanned >> 20, fresh_total);
+}
+
+// 扫描线程：90 秒后自动扫大厅；此后每 5 秒检查 scan_now 触发文件
+static void start_memory_scanner() {
+    std::thread([]{
+        sleep(90);
+        scan_memory_for_korean("自动-大厅表装载后");
+        while (true) {
+            sleep(5);
+            FILE *t = fopen("/sdcard/Download/scan_now", "rb");
+            if (t) {
+                fclose(t);
+                remove("/sdcard/Download/scan_now");
+                scan_memory_for_korean("手动触发(scan_now)");
+            }
+        }
+    }).detach();
+    LOGI("【内存扫描】扫描线程已启动（90 秒后自动扫一次；扫描期间可在共享目录新建 scan_now 文件随时触发）");
 }
 
 // ==================== runtime_invoke 监控（定位剧情加载函数）====================
@@ -704,6 +830,10 @@ void hack_start(const char *game_data_dir) {
             // 启动自动日志落盘：fork 子进程跑 logcat，把 chopperhl 标签日志写入
             // /sdcard/Download/chopperhl_log.txt，用户无需手动 adb logcat。
             start_auto_logcat();
+
+            // 启动原生内存韩文扫描线程（90 秒后自动扫大厅；scan_now 文件随时触发）。
+            // 全量采集主力：大厅表装载后扫一次即可拿到大部分游戏文本。
+            start_memory_scanner();
 
             break;
         }
