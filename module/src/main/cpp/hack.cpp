@@ -46,20 +46,33 @@
 #include <cstdlib>
 #include <mutex>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <ctime>
 #include <limits.h>
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
 
 // ==================== 自动日志落盘 ====================
-// hack_start 末尾启动一个后台线程跑 `logcat`，把本模块日志（tag=chopperhl）
-// 自动写入 /sdcard/Download/chopperhl_log.txt，用户无需手动 adb logcat。
+// hack_start 末尾 fork 子进程跑 logcat，把本模块日志（tag=chopperhl）自动
+// 写入 /sdcard/Download/chopperhl_log.txt，用户无需手动 adb logcat。
+// 用 fork+execl 直接执行 /system/bin/logcat（不经过 shell），更可靠。
 static void start_auto_logcat() {
-    std::thread([]{
-        // 先清空旧日志，再开始持续抓取（阻塞式，线程随进程生命周期存活）
-        system("logcat -c");
-        system("logcat -v time chopperhl:v *:F -f /sdcard/Download/chopperhl_log.txt");
-    }).detach();
+    pid_t pid = fork();
+    if (pid == 0) {
+        // 子进程：先清缓冲，再持续写文件（阻塞直到游戏进程退出）
+        execl("/system/bin/logcat", "logcat", "-c", nullptr);
+        _exit(127);
+    } else if (pid > 0) {
+        waitpid(pid, nullptr, 0);  // 等清缓冲完成
+    }
+    pid = fork();
+    if (pid == 0) {
+        execl("/system/bin/logcat", "logcat", "-v", "time",
+              "chopperhl:v", "*:S",
+              "-f", "/sdcard/Download/chopperhl_log.txt", nullptr);
+        _exit(127);
+    }
+    LOGI("【成功】自动日志已启动（logcat PID %d），写入 /sdcard/Download/chopperhl_log.txt", pid);
 }
 
 // ==================== il2cpp API 外部声明（定义在 il2cpp_dump.cpp，由 il2cpp_api_init 初始化）====================
@@ -236,6 +249,13 @@ void preload_captured_texts() {
     int count = 0;
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        // 文件中 \n 是字面两字符（\ 和 n），需还原为真实换行符(0x0A)
+        // 才能与运行时捕获的字符串格式一致，否则多行文本每次都被重复采集
+        size_t pos = 0;
+        while ((pos = line.find("\\n", pos)) != std::string::npos) {
+            line.replace(pos, 2, "\n");
+            pos += 1;
+        }
         if (!line.empty()) {
             captured_kr_texts.insert(line);
             count++;
@@ -410,14 +430,85 @@ static void net_capture_result(MyIl2CppString *s) {
 
 static MyIl2CppString *my_string_new(const char *utf8) {
     MyIl2CppString *r = old_string_new(utf8);
+    // 前 20 条韩文捕获同时打印调用者 RVA，辅助定位剧情数据加载函数
+    if (r && r->length > 0 && contains_korean(r->chars, r->length)) {
+        static int caller_cnt = 0;
+        if (caller_cnt < 20) {
+            caller_cnt++;
+            uintptr_t base = get_module_base("libil2cpp.so");
+            void *ra = __builtin_return_address(0);
+            if ((uintptr_t)ra > base)
+                LOGI("【调用源】string_new caller RVA 0x%lx",
+                     (unsigned long)((uintptr_t)ra - base));
+        }
+    }
     net_capture_result(r);
     return r;
 }
 
 static MyIl2CppString *my_string_new_utf16(const char16_t *utf16, int32_t len) {
     MyIl2CppString *r = old_string_new_utf16(utf16, len);
+    if (r && r->length > 0 && contains_korean(r->chars, r->length)) {
+        static int caller_cnt = 0;
+        if (caller_cnt < 20) {
+            caller_cnt++;
+            uintptr_t base = get_module_base("libil2cpp.so");
+            void *ra = __builtin_return_address(0);
+            if ((uintptr_t)ra > base)
+                LOGI("【调用源】string_new_utf16 caller RVA 0x%lx",
+                     (unsigned long)((uintptr_t)ra - base));
+        }
+    }
     net_capture_result(r);
     return r;
+}
+
+// ==================== runtime_invoke 监控（定位剧情加载函数）====================
+// il2cpp_runtime_invoke 是 IL2CPP 运行时调用托管方法的入口（反射调用、Unity
+// 事件系统、协程等经此路径）。hook 后记录所有被调用方法的名字（去重），用户
+// 进剧场选一集剧情时，日志中新增的方法名即为加载剧情数据的候选入口函数。
+// 注意：IL2CPP 直接编译的方法调用不走 runtime_invoke（A→B 是直接 call），但
+// Unity 内部系统（事件/协程/资源加载）很多经此调用，足以定位触发点。
+
+typedef const char *(*method_get_name_fn)(const void *method);
+typedef void *(*runtime_invoke_fn)(const void *method, void *object,
+                                   void **params, void **exc);
+static method_get_name_fn  il2cpp_method_get_name_ptr = nullptr;
+static runtime_invoke_fn   old_runtime_invoke = nullptr;
+static std::unordered_set<std::string> g_invoke_seen;
+static std::mutex           g_invoke_mutex;
+static int g_invoke_total  = 0;
+static int g_invoke_unique = 0;
+static time_t g_invoke_last_log = 0;
+
+static void *my_runtime_invoke(const void *method, void *object,
+                               void **params, void **exc) {
+    // 先调原函数——游戏逻辑永远不受影响
+    void *result = old_runtime_invoke
+                       ? old_runtime_invoke(method, object, params, exc)
+                       : nullptr;
+
+    if (il2cpp_method_get_name_ptr && method) {
+        const char *name = il2cpp_method_get_name_ptr(method);
+        if (name) {
+            g_invoke_total++;
+            bool is_new = false;
+            {
+                std::lock_guard<std::mutex> lk(g_invoke_mutex);
+                is_new = g_invoke_seen.insert(std::string(name)).second;
+                if (is_new) g_invoke_unique++;
+            }
+            if (is_new && g_invoke_unique <= 500)
+                LOGI("【invoke】#%d %s", g_invoke_unique, name);
+            time_t now = time(nullptr);
+            if (now - g_invoke_last_log >= 30) {
+                LOGI("【invoke心跳】总调用 %d 次，唯一方法 %d 个",
+                     g_invoke_total, g_invoke_unique);
+                g_invoke_last_log = now;
+            }
+        }
+    }
+    return result;
 }
 
 // ==================== 按名查找并安装 Hook ====================
@@ -551,6 +642,36 @@ void hack_start(const char *game_data_dir) {
                     LOGI("【提示】字符串创建符号未找到，全量韩文库跳过（set_text 捕获仍有效）");
             }
 
+            // runtime_invoke 监控（定位剧情加载函数）：绑定 method_get_name +
+            // hook runtime_invoke 的真实实现，记录所有被调用的方法名（去重）。
+            // 失败安全，装不上不影响翻译和捕获。
+            {
+                size_t sz_ri = 0;
+                void *sym_mgn = xdl_sym(handle, "il2cpp_method_get_name", &sz_ri);
+                if (sym_mgn) {
+                    il2cpp_method_get_name_ptr = (method_get_name_fn)sym_mgn;
+                    LOGI("【invoke】il2cpp_method_get_name 绑定 %p", sym_mgn);
+                } else {
+                    LOGI("【提示】il2cpp_method_get_name 未找到，invoke 监控跳过");
+                }
+
+                size_t sz_rinv = 0;
+                void *sym_ri = xdl_sym(handle, "il2cpp_runtime_invoke", &sz_rinv);
+                if (sym_mgn && sym_ri) {
+                    uintptr_t base = get_module_base("libil2cpp.so");
+                    void *t_ri = resolve_thunk_target(sym_ri, base);
+                    if (t_ri && !already_dobby_patched(t_ri)) {
+                        if (DobbyHook(t_ri, (void *)my_runtime_invoke,
+                                      (void **)&old_runtime_invoke) == 0)
+                            LOGI("【成功】runtime_invoke 监控已安装 @ %p", t_ri);
+                        else
+                            LOGI("【提示】runtime_invoke hook 失败，监控跳过");
+                    }
+                } else {
+                    LOGI("【提示】il2cpp_runtime_invoke 符号未找到，监控跳过");
+                }
+            }
+
             // 立即安装：self-SIGKILL 已被拦截，游戏启动完整性检测的自杀手段失效，
             // 无需再靠 sleep(25) 躲避检测窗口。文本 hook 越早就位，启动阶段的
             // 韩文捕获与翻译覆盖越完整。
@@ -566,10 +687,9 @@ void hack_start(const char *game_data_dir) {
             if (!hooked)
                 LOGE("【错误】多次重试后仍未完成 hook 安装。");
 
-            // 启动自动日志落盘：logcat 后台线程把 chopperhl 标签日志写入
+            // 启动自动日志落盘：fork 子进程跑 logcat，把 chopperhl 标签日志写入
             // /sdcard/Download/chopperhl_log.txt，用户无需手动 adb logcat。
             start_auto_logcat();
-            LOGI("【成功】自动日志已启动，写入 /sdcard/Download/chopperhl_log.txt");
 
             break;
         }
