@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <sys/stat.h>
+#include <ctime>
 #include <limits.h>
 
 extern "C" int DobbyHook(void *function_address, void *replace_call, void **origin_call);
@@ -259,8 +260,20 @@ static bool record_captured_korean(const char16_t *chars, int32_t len, const cha
     }
     static int total = 0;
     int n = ++total;
-    if (n <= 100 || n % 500 == 0)
+    // 日志策略：#1~#100 逐条；之后每 30 秒打一次心跳汇总（仅在有新增时），
+    // 避免长时间静默让人无法区分"没捕获到"与"捕获正常但都被去重"。
+    static int last_beat_total = 0;
+    static time_t last_beat_time = 0;
+    time_t now = time(nullptr);
+    if (n <= 100) {
         LOGI("【%s】#%d %s", tag, n, text.c_str());
+    } else if (now - last_beat_time >= 30) {
+        LOGI("【%s心跳】累计新增 %d 条（近30秒 +%d）", tag, n, n - last_beat_total);
+        last_beat_total = n;
+        last_beat_time = now;
+    } else if (n % 500 == 0) {
+        LOGI("【%s】#%d %s", tag, n, text.c_str());
+    }
     return true;
 }
 
