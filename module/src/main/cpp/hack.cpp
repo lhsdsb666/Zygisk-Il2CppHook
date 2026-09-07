@@ -3,9 +3,11 @@
 //
 // 当前活路径（实验性解密 dump / 加解密探针 / 枚举类查找已删除：热更新后剧情
 // 装载原生侧化，托管层加解密探针实测全程零触发，留着只增崩溃面）：
-//   1. 文本翻译：按名 hook TMPro.TMP_Text.set_text 与 UnityEngine.UI.Text.set_text
-//      （il2cpp_class_from_name 按名查找，不硬编码 RVA，游戏更新零维护），
-//      查 string_data.txt 字典把韩文替换为中文。
+//   1. 文本翻译：按名 hook 5 个文本入口——TMPro.TMP_Text.set_text（基类）、
+//      TextMeshProUGUI/TextMeshPro 子类重写 set_text（名字牌/图鉴名实际走的
+//      路径，2026-09-07 实测基类被虚分派绕过）、TMP_Text.SetText 内部方法、
+//      UnityEngine.UI.Text.set_text。查 string_data.txt 字典：整句精确 →
+//      去标签/空白归一化 → 术语逐词替换（数字/标点保留）。
 //   2. 韩文采集（增量）：set_text 钩子 + il2cpp_string_new / il2cpp_string_new_utf16
 //      全量捕获网。任何托管字符串（含原生 AssetBundle 反序列化直接构造的）
 //      创建时若含谚文，一律去重落盘 captured_korean.txt，供离线批量翻译。
@@ -492,6 +494,30 @@ void my_ugi_set_text(void *__this, MyIl2CppString *il2cpp_string) {
     process_and_forward(__this, il2cpp_string, old_ugi_set_text);
 }
 
+// ---- TMP 子类重写路径（2026-09-07 名字牌不翻译修复）----
+// 实测：对话正文（走 legacy UI.Text）能翻译，但剧情名字牌/图鉴角色名
+// （TMP UGUI 组件）永远不翻译——部分 TMP 版本中 TextMeshProUGUI /
+// TextMeshPro 重写(override)了 text 属性，游戏给这类组件赋值时虚分派到
+// 子类 set_text，完全不经过我们挂钩的基类 TMP_Text.set_text。
+// 另外部分代码走 TMP_Text.SetText(string) 内部方法，同样绕过属性 setter。
+// 三个入口全部挂上，各自转发到各自原函数；重复翻译是安全的（中文不含
+// 谚文，内层钩子查不到字典直接放行）。
+static set_text_fn old_tmp_ugi_set_text  = nullptr;  // TextMeshProUGUI.set_text
+static set_text_fn old_tmp3d_set_text    = nullptr;  // TextMeshPro.set_text
+static set_text_fn old_tmptext_settext   = nullptr;  // TMP_Text.SetText(string)
+
+void my_tmp_ugi_set_text(void *__this, MyIl2CppString *il2cpp_string) {
+    process_and_forward(__this, il2cpp_string, old_tmp_ugi_set_text);
+}
+
+void my_tmp3d_set_text(void *__this, MyIl2CppString *il2cpp_string) {
+    process_and_forward(__this, il2cpp_string, old_tmp3d_set_text);
+}
+
+void my_tmptext_settext(void *__this, MyIl2CppString *il2cpp_string) {
+    process_and_forward(__this, il2cpp_string, old_tmptext_settext);
+}
+
 // ==================== 全量韩文捕获网（版本无关，2026-09-04）====================
 // 背景：热更新后剧情数据不再经过 TextAsset.bytes / mscorlib 加密通道（原生
 // AssetBundle/热更文件反序列化直接构造托管字符串），按类名找解密器已无意义。
@@ -788,7 +814,13 @@ static void start_memory_scanner() {
 typedef const char *(*method_get_name_fn)(const void *method);
 typedef void *(*runtime_invoke_fn)(const void *method, void *object,
                                    void **params, void **exc);
+// 参数类型校验用（hack_start 里 xdl_sym 解析；SetText 有 string/StringBuilder
+// 两个 1 参重载，按名查找可能命中 StringBuilder 版本，不校验会按错误布局读内存）
+typedef const void *(*method_get_param_fn)(const void *method, uint32_t index);
+typedef char *(*type_get_name_fn)(const void *type);
 static method_get_name_fn  il2cpp_method_get_name_ptr = nullptr;
+static method_get_param_fn il2cpp_method_get_param_ptr = nullptr;
+static type_get_name_fn    il2cpp_type_get_name_ptr = nullptr;
 static runtime_invoke_fn   old_runtime_invoke = nullptr;
 static std::unordered_set<std::string> g_invoke_seen;
 static std::mutex           g_invoke_mutex;
@@ -852,6 +884,31 @@ static bool hook_text_method(const char *ns, const char *cls, const char *method
             LOGE("【错误】找到 %s.%s 但 %s 方法指针为空", ns, cls, method_name);
             return false;
         }
+        // 防重复挂钩：类没有独立重写时，按名查找会沿继承链找到基类方法——
+        // 其入口已被我们先前的钩子内联补丁覆盖。对已补丁地址再挂 Dobby 会把
+        // 跳转数据当原始指令生成 trampoline → 无限递归栈溢出。视为已覆盖。
+        if (already_dobby_patched((void *)method->methodPointer)) {
+            LOGI("【提示】%s.%s.%s 入口已被挂钩（无独立重写，继承基类），跳过", ns, cls, method_name);
+            return true;
+        }
+        // SetText 重载歧义防护：TMP_Text 有 SetText(string) 与
+        // SetText(StringBuilder) 两个 1 参重载，按名+参数个数可能命中后者，
+        // 按 Il2CppString 布局读 StringBuilder 会崩。必须校验首参是 string。
+        if (strcmp(method_name, "SetText") == 0) {
+            bool is_string = false;
+            if (il2cpp_method_get_param_ptr && il2cpp_type_get_name_ptr) {
+                const void *ptype = il2cpp_method_get_param_ptr(method, 0);
+                if (ptype) {
+                    // 返回串由 il2cpp 分配，仅调用数次，刻意不释放（避免依赖 il2cpp_free）
+                    char *tn = il2cpp_type_get_name_ptr(ptype);
+                    if (tn) is_string = (strcmp(tn, "System.String") == 0);
+                }
+            }
+            if (!is_string) {
+                LOGI("【提示】%s.%s.%s 首参不是 string（命中 StringBuilder 重载），跳过", ns, cls, method_name);
+                return false;
+            }
+        }
         DobbyHook((void *)method->methodPointer, replace_func, origin_func);
         LOGI("【成功】%s.%s.%s Hook 完成（按名查找，地址 %p）", ns, cls, method_name, method->methodPointer);
         return true;
@@ -861,11 +918,15 @@ static bool hook_text_method(const char *ns, const char *cls, const char *method
 }
 
 // 返回 true 表示关键文本 hook（TMP 主路径）已就绪；可安全重试，已装的不会重装。
-// 文本翻译只依赖两个 set_text；表解密/探针等实验性代码已于 2026-09-04 移除
-// （热更新后剧情装载已原生侧化，托管层加解密探针全程零触发，留着只增崩溃面）。
+// 文本翻译入口共 5 个：TMP 基类 set_text、TMP UGUI/3D 子类重写 set_text、
+// TMP_Text.SetText 内部方法、legacy UI.Text set_text。名字牌/图鉴名走子类
+// 重写路径（2026-09-07 实测基类被绕过），必须全部覆盖。
 bool install_hooks_by_name() {
-    static bool tmp_done = false;    // TextMeshPro 主路径
-    static bool ugi_done = false;    // legacy uGUI Text（部分列表/旧UI使用）
+    static bool tmp_done = false;     // TMP_Text.set_text（基类）
+    static bool ugi_done = false;     // legacy uGUI Text（部分列表/旧UI使用）
+    static bool tmp_ugi_done = false; // TextMeshProUGUI.set_text（子类重写）
+    static bool tmp3d_done = false;   // TextMeshPro.set_text（3D，附加）
+    static bool settext_done = false; // TMP_Text.SetText（内部路径，附加）
 
     if (!tmp_done)
         tmp_done = hook_text_method("TMPro", "TMP_Text", "set_text",
@@ -873,9 +934,20 @@ bool install_hooks_by_name() {
     if (!ugi_done)
         ugi_done = hook_text_method("UnityEngine.UI", "Text", "set_text",
                                     (void *)my_ugi_set_text, (void **)&old_ugi_set_text);
+    if (!tmp_ugi_done)
+        tmp_ugi_done = hook_text_method("TMPro", "TextMeshProUGUI", "set_text",
+                                        (void *)my_tmp_ugi_set_text, (void **)&old_tmp_ugi_set_text);
+    if (!tmp3d_done)
+        tmp3d_done = hook_text_method("TMPro", "TextMeshPro", "set_text",
+                                      (void *)my_tmp3d_set_text, (void **)&old_tmp3d_set_text);
+    if (!settext_done)
+        settext_done = hook_text_method("TMPro", "TMP_Text", "SetText",
+                                        (void *)my_tmptext_settext, (void **)&old_tmptext_settext);
 
     if (ugi_done)
         LOGI("【成功】legacy UI.Text 附加 Hook 生效，覆盖更多文本组件。");
+    if (tmp_ugi_done)
+        LOGI("【成功】TextMeshProUGUI.set_text 已挂钩——名字牌/图鉴名修复路径生效。");
 
     return tmp_done;
 }
@@ -974,6 +1046,17 @@ void hack_start(const char *game_data_dir) {
                 } else {
                     LOGI("【提示】il2cpp_method_get_name 未找到，invoke 监控跳过");
                 }
+
+                // SetText 重载歧义防护所需的参数类型校验 API（缺失时 SetText 跳过不挂）
+                size_t sz_p = 0, sz_t = 0;
+                void *sym_mgp = xdl_sym(handle, "il2cpp_method_get_param", &sz_p);
+                void *sym_tgn = xdl_sym(handle, "il2cpp_type_get_name", &sz_t);
+                if (sym_mgp) il2cpp_method_get_param_ptr = (method_get_param_fn)sym_mgp;
+                if (sym_tgn) il2cpp_type_get_name_ptr = (type_get_name_fn)sym_tgn;
+                if (sym_mgp && sym_tgn)
+                    LOGI("【提示】参数类型校验 API 已就绪（method_get_param/type_get_name）");
+                else
+                    LOGI("【提示】参数类型校验 API 不可用，SetText 附加钩子将跳过");
 
                 size_t sz_rinv = 0;
                 void *sym_ri = xdl_sym(handle, "il2cpp_runtime_invoke", &sz_rinv);
