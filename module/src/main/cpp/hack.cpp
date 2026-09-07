@@ -177,8 +177,82 @@ struct MyIl2CppString {
 };
 
 std::unordered_map<std::string, std::string> translation_map;
+// 术语表：从字典抽取的纯谚文短词（人名/UI词，2~8音节），用于整句未命中时
+// 的逐词替换（数字/标点/标签原样保留），解决"活动还剩3天16小时"这类模板文本。
+std::unordered_map<std::string, std::string> term_map;
 std::unordered_set<std::string> captured_kr_texts;
 static std::mutex capture_mutex;  // set_text 可能被游戏多线程并发调用
+
+// 判断 UTF-8 字节 i 处是否为谚文音节(U+AC00-U+D7A3)，是返回字节数3，否则0
+static int hangul_at(const char *s, size_t i, size_t n) {
+    if (i + 3 > n) return 0;
+    unsigned char b0 = (unsigned char)s[i], b1 = (unsigned char)s[i+1], b2 = (unsigned char)s[i+2];
+    bool c2 = (b2 >= 0x80 && b2 <= 0xBF);
+    if (b0 == 0xEA && b1 >= 0xB0 && b1 <= 0xBF && c2) return 3;
+    if (b0 == 0xEB && b1 >= 0x80 && b1 <= 0xBF && c2) return 3;
+    if (b0 == 0xEC && b1 >= 0x80 && b1 <= 0xBF && c2) return 3;
+    if (b0 == 0xED && b1 >= 0x80 && b1 <= 0x9E && b2 >= 0x80 && b2 <= 0xA3) return 3;
+    return 0;
+}
+
+// 查找用归一化：去掉富文本标签 <...> 与首尾空白。剧情人名同一位置忽译忽不译，
+// 根因是两次 set_text 传入的串一个带 <color>/<size> 标签或尾随空格、一个不带，
+// 整串精确匹配只中一次。归一化后内容一致即可稳定命中。
+static std::string normalize_for_lookup(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    bool intag = false;
+    for (char c : s) {
+        if (c == '<') { intag = true; continue; }
+        if (c == '>') { intag = false; continue; }
+        if (!intag) out.push_back(c);
+    }
+    size_t b = out.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = out.find_last_not_of(" \t\r\n");
+    return out.substr(b, e - b + 1);
+}
+
+// 常见谚文助词（替换术语时连带省略，中文不需要）
+static const std::unordered_set<std::string> g_particles = {
+    "가","이","을","를","은","는","와","과","도","만","에","께","라","나","마","냐","고",
+    "한테","까지","처럼","보다","부터","조차","에게","께서","에서","하고","이나","나마","랑","이랑"
+};
+
+// 整句未命中时的逐词替换：句中纯谚文连续段若命中术语表则换成中文，数字/标点/
+// 空格/标签原样保留；带助词的人名（네르가→奈尔）自动剥离常见助词尾。返回是否改。
+static bool apply_terms(std::string &s) {
+    bool changed = false;
+    size_t n = s.size(), i = 0;
+    std::string out;
+    out.reserve(n);
+    while (i < n) {
+        if (hangul_at(s.c_str(), i, n) == 0) { out.push_back(s[i]); i++; continue; }
+        size_t start = i;
+        while (i < n) {
+            int a = hangul_at(s.c_str(), i, n);
+            if (a == 0) break;
+            i += a;
+        }
+        std::string run = s.substr(start, i - start);
+        auto it = term_map.find(run);
+        if (it != term_map.end()) { out += it->second; changed = true; continue; }
+        // 尝试剥离 1~3 个尾音节助词（核心至少保留 2 音节）
+        bool replaced = false;
+        for (int strip = 1; strip <= 3 && run.size() >= (size_t)(strip + 2) * 3; strip++) {
+            std::string core = run.substr(0, run.size() - strip * 3);
+            std::string tail = run.substr(run.size() - strip * 3);
+            auto ti = term_map.find(core);
+            if (ti != term_map.end() && g_particles.count(tail)) {
+                out += ti->second;   // 省略助词
+                changed = true; replaced = true; break;
+            }
+        }
+        if (!replaced) out += run;
+    }
+    if (changed) s.swap(out);
+    return changed;
+}
 
 static MyIl2CppString *(*il2cpp_string_new_ptr)(const char *str) = nullptr;
 
@@ -235,12 +309,25 @@ void load_translation_dict() {
         if (line[0] == '#') continue;
         size_t pos = line.find('=');
         if (pos != std::string::npos) {
-            translation_map[unescape_newlines(line.substr(0, pos))] = unescape_newlines(line.substr(pos + 1));
+            std::string key = unescape_newlines(line.substr(0, pos));
+            std::string val = unescape_newlines(line.substr(pos + 1));
+            translation_map[key] = val;
             count++;
+            // 纯谚文短词（2~8 音节、无空格/标点/标签）进术语表，供逐词替换
+            if (key.size() >= 6 && key.size() <= 24) {
+                bool pure = true;
+                for (size_t j = 0; j < key.size();) {
+                    int a = hangul_at(key.c_str(), j, key.size());
+                    if (a == 0) { pure = false; break; }
+                    j += a;
+                }
+                if (pure) term_map[key] = val;
+            }
         }
     }
     file.close();
-    LOGI("【汉化提示】字典加载成功！共读入 %d 条翻译词条。", count);
+    LOGI("【汉化提示】字典加载成功！共读入 %d 条翻译词条（含 %d 个术语短词）。",
+         count, (int)term_map.size());
 }
 
 // 启动时预加载已捕获的韩文，避免重启后重复写入
@@ -367,12 +454,28 @@ static void process_and_forward(void *__this, MyIl2CppString *il2cpp_string, set
             record_captured_korean(il2cpp_string->chars, il2cpp_string->length, "文本捕获");
         }
 
-        // 查字典翻译
+        // 查字典翻译：① 原文精确匹配；② 去标签/空白后归一化匹配（治人名忽译
+        // 忽不译）；③ 整句未命中时逐词替换术语（治"3天16小时"这类带数字模板）。
+        std::string translated;
+        bool matched = false;
         auto it = translation_map.find(original_text);
-        if (it != translation_map.end() && il2cpp_string_new_ptr != nullptr) {
-            MyIl2CppString *new_string = il2cpp_string_new_ptr(it->second.c_str());
+        if (it == translation_map.end()) {
+            std::string norm = normalize_for_lookup(original_text);
+            if (!norm.empty() && norm != original_text) {
+                auto jt = translation_map.find(norm);
+                if (jt != translation_map.end()) it = jt;
+            }
+        }
+        if (it != translation_map.end()) {
+            translated = it->second; matched = true;
+        } else if (contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
+            std::string tmp = original_text;
+            if (apply_terms(tmp)) { translated = tmp; matched = true; }
+        }
+        if (matched && il2cpp_string_new_ptr != nullptr) {
+            MyIl2CppString *new_string = il2cpp_string_new_ptr(translated.c_str());
             if (new_string != nullptr) {
-                LOGI("【汉化匹配】%s -> %s", original_text.c_str(), it->second.c_str());
+                LOGI("【汉化匹配】%s -> %s", original_text.c_str(), translated.c_str());
                 return origin(__this, new_string);
             }
         }
