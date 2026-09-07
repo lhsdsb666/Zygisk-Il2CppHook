@@ -13,8 +13,8 @@
 //   3. 韩文采集（全量主力）：原生内存韩文扫描。剧场实测证明剧情文本由 AOT
 //      代码在显示瞬间才构造（runtime_invoke 零新增、调用链在 libhoudini 下
 //      不可靠），但文本数据加载后常驻本进程内存——直接扫可写映射提取谚文
-//      UTF-8 序列，一次拿全（含未显示分支）。90 秒自动扫大厅 + scan_now
-//      触发文件随时补扫。
+//      UTF-8 + UTF-16LE 序列，拿全（含未显示分支）。90 秒首次自动扫，此后
+//      每 120 秒自动扫（游戏流式加载数据需要时间）；scan_now 文件随时触发。
 //   4. 防自杀：hook exit/_exit/kill/tgkill，拦截启动完整性检测的自毁。
 //   5. 诊断：runtime_invoke 监控（唯一方法名去重日志，定位反射路径调用）。
 //
@@ -496,19 +496,30 @@ static int utf8_decode_one(const uint8_t *p, const uint8_t *e, uint32_t &cp) {
 }
 
 static bool is_hangul_syllable(uint32_t cp) { return cp >= 0xAC00 && cp <= 0xD7A3; }
-// run 内允许的字符：可打印 ASCII + 任意有效 UTF-8（控制字符/DEL 断开 run）
-static bool is_run_char(uint32_t cp) { return cp >= 0x20 && cp != 0x7F; }
+// run 内允许的字符：可打印 ASCII + 谚文音节/字母 + 韩文常用标点区。
+// 不收其他文字区（拉丁扩展/西里尔/阿拉伯/CJK 汉字等）——内存里紧邻的
+// 键名字符串（如 Character_Beni_Ep03_026）和外文垃圾会粘进正文，
+// 收紧后它们会断开 run 被自然丢弃（实测出现过阿拉伯字符粘连）。
+static bool is_run_char(uint32_t cp) {
+    if (cp >= 0x20 && cp < 0x7F) return true;          // ASCII 可打印
+    if (cp >= 0xAC00 && cp <= 0xD7A3) return true;     // 谚文音节
+    if (cp >= 0x1100 && cp <= 0x11FF) return true;     // 谚文字母
+    if (cp >= 0x3130 && cp <= 0x318F) return true;     // 谚文兼容字母
+    if (cp >= 0x3000 && cp <= 0x303F) return true;     // CJK 标点（…、「」等）
+    if (cp >= 0x2010 && cp <= 0x2027) return true;     // 通用标点（–—''""…）
+    if (cp >= 0xFF00 && cp <= 0xFFEF) return true;     // 全角形式
+    return false;
+}
 
-// 扫描一段内存，提取含 ≥2 个谚文音节的文本 run
-static void scan_region_for_korean(const uint8_t *p, size_t len,
-                                   int &fresh, FILE *batch) {
+// 扫描一段内存的 UTF-8 文本，提取含 ≥2 个谚文音节的 run
+static void scan_region_utf8(const uint8_t *p, size_t len,
+                             int &fresh, FILE *batch) {
     const uint8_t *q = p, *e = p + len;
     std::string run;
     run.reserve(256);
     int hangul = 0;
     auto flush = [&]() {
         if (hangul >= 2 && run.size() >= 3 && run.size() <= 4096) {
-            // 去首尾空白
             size_t b = 0, t = run.size();
             while (b < t && (run[b] == ' ' || run[b] == '\t')) b++;
             while (t > b && (run[t-1] == ' ' || run[t-1] == '\t')) t--;
@@ -533,70 +544,135 @@ static void scan_region_for_korean(const uint8_t *p, size_t len,
     flush();
 }
 
+// 扫描一段内存的 UTF-16LE 文本（IL2CPP string 对象的数据区）
+// IL2CPP string 布局: klass@0x00(8B) monitor@0x08(8B) length@0x10(4B) chars@0x14
+// 在 GC 堆中 string 对象密集排列，chars 数据连续分布在堆内存里。
+// UTF-16LE 谚文音节 U+AC00-U+D7A3 = 字节对 [low, 0xAC-0xD7]。
+static void scan_region_utf16le(const uint8_t *p, size_t len,
+                                int &fresh, FILE *batch) {
+    if (len < 4) return;
+    const uint8_t *q = p, *e = p + len - 1;  // -1: 需要完整 2 字节对
+    // UTF-16LE char → 码点
+    auto decode_u16 = [](const uint8_t *q, uint32_t &cp) -> int {
+        uint16_t v = q[0] | (q[1] << 8);
+        cp = v;
+        return 2;
+    };
+    auto is_run_u16 = [](uint32_t cp) -> bool {
+        if (cp >= 0x20 && cp < 0x7F) return true;
+        if (cp >= 0xAC00 && cp <= 0xD7A3) return true;
+        if (cp >= 0x1100 && cp <= 0x11FF) return true;
+        if (cp >= 0x3130 && cp <= 0x318F) return true;
+        if (cp >= 0x3000 && cp <= 0x303F) return true;
+        if (cp >= 0x2010 && cp <= 0x2027) return true;
+        if (cp >= 0xFF00 && cp <= 0xFFEF) return true;
+        return false;
+    };
+    std::u16string run16;
+    run16.reserve(256);
+    int hangul = 0;
+    auto flush = [&]() {
+        if (hangul >= 4 && run16.size() >= 4 && run16.size() <= 4096) {
+            // UTF-16 → UTF-8
+            std::string text = utf16_to_utf8(run16.data(), (int32_t)run16.size());
+            if (text.size() >= 3 && record_korean_utf8(text)) {
+                fresh++;
+                write_captured_line(text, batch);
+            }
+        }
+        run16.clear();
+        hangul = 0;
+    };
+    while (q < e) {
+        // 跳过奇数对齐：UTF-16 必须从偶数地址开始才有效。
+        // 但在 GC 堆中 string 对象按 8/16 字节对齐，chars 起始在偶数地址。
+        // 如果当前地址是奇数且第一个字节看起来不是有效 UTF-16 起始，跳一字节。
+        uint32_t cp;
+        int n = decode_u16(q, cp);
+        if (!is_run_u16(cp)) { flush(); q += 2; continue; }
+        if (cp >= 0xAC00 && cp <= 0xD7A3) hangul++;
+        run16.push_back((char16_t)cp);
+        if (run16.size() > 4096) flush();
+        q += 2;
+    }
+    flush();
+}
+
 static void scan_memory_for_korean(const char *why) {
     LOGI("【内存扫描】开始（%s）...", why);
     FILE *mf = fopen("/proc/self/maps", "r");
     if (!mf) { LOGI("【内存扫描】无法打开 /proc/self/maps，放弃"); return; }
     FILE *batch = fopen("/sdcard/Download/captured_korean.txt", "a");
     if (!batch) { fclose(mf); LOGI("【内存扫描】无法打开输出文件，放弃"); return; }
+    setvbuf(batch, nullptr, _IONBF, 0);
 
     char line[1024];
-    int regions = 0, fresh_total = 0;
+    int regions = 0, fresh_utf8 = 0, fresh_utf16 = 0;
     size_t scanned = 0, next_progress = 512ull << 20;
     while (fgets(line, sizeof(line), mf)) {
-        // 32/64 位通吃：用 unsigned long long 中转（%llx），再转 uintptr_t
         unsigned long long s_ = 0, e_ = 0, inode = 0;
         char perms[8] = {0};
         int po = -1;
-        // 格式：start-end perms offset dev inode [path]
         if (sscanf(line, "%llx-%llx %4s %*s %*s %llu %n",
                    &s_, &e_, perms, &inode, &po) < 4) continue;
         uintptr_t start = (uintptr_t)s_, end = (uintptr_t)e_;
         if (end <= start) continue;
         size_t len = end - start;
-        if (len < 4096 || len > (1ull << 30)) continue;         // 跳过 <4KB / >1GB
-        if (perms[0] != 'r' || perms[1] != 'w') continue;        // 只扫可写私有（堆/匿名/数据）
+        if (len < 4096 || len > (1ull << 30)) continue;
+        if (perms[0] != 'r' || perms[1] != 'w') continue;
 
-        // 路径判定：po 之后非空白 = 文件映射；只关心游戏数据文件
         bool has_path = false;
         if (po > 0 && po < (int)sizeof(line)) {
             const char *path = line + po;
             while (*path == ' ') path++;
             has_path = (*path != '\0' && *path != '\n');
-            if (has_path && !strstr(path, "epidgames")) continue; // 排除系统库等文件映射
+            if (has_path && !strstr(path, "epidgames")) continue;
         }
-        // 无路径的匿名 rw 映射 + 游戏数据文件映射都扫
 
         regions++;
-        scan_region_for_korean((const uint8_t *)start, len, fresh_total, batch);
+        // 先扫 UTF-8（原始数据文件/JSON/CSV），再扫 UTF-16LE（IL2CPP string 对象）
+        scan_region_utf8((const uint8_t *)start, len, fresh_utf8, batch);
+        scan_region_utf16le((const uint8_t *)start, len, fresh_utf16, batch);
         scanned += len;
         if (scanned >= next_progress) {
-            LOGI("【内存扫描】进度 %zu MB，当前新增 %d 条", scanned >> 20, fresh_total);
+            LOGI("【内存扫描】进度 %zu MB，UTF-8 +%d UTF-16 +%d",
+                 scanned >> 20, fresh_utf8, fresh_utf16);
             next_progress += 512ull << 20;
         }
     }
     fclose(batch);
     fclose(mf);
-    LOGI("【内存扫描】完成（%s）：区域 %d 个，扫描 %zu MB，新增 %d 条韩文",
-         why, regions, scanned >> 20, fresh_total);
+    LOGI("【内存扫描】完成（%s）：区域 %d 个，扫描 %zu MB，新增 UTF-8 %d 条 + UTF-16 %d 条",
+         why, regions, scanned >> 20, fresh_utf8, fresh_utf16);
 }
 
-// 扫描线程：90 秒后自动扫大厅；此后每 5 秒检查 scan_now 触发文件
+// 扫描线程：90 秒后首次自动扫；此后每 120 秒自动扫一次（捕获后续加载的
+// 数据），同时每 5 秒检查 scan_now 触发文件。每次扫描都走全量去重，
+// 已有条目不会重复写入——只增不丢。
 static void start_memory_scanner() {
     std::thread([]{
         sleep(90);
-        scan_memory_for_korean("自动-大厅表装载后");
+        int round = 0;
         while (true) {
-            sleep(5);
-            FILE *t = fopen("/sdcard/Download/scan_now", "rb");
-            if (t) {
-                fclose(t);
-                remove("/sdcard/Download/scan_now");
-                scan_memory_for_korean("手动触发(scan_now)");
+            round++;
+            char why[64];
+            snprintf(why, sizeof(why), "自动第%d轮", round);
+            scan_memory_for_korean(why);
+            // 等 120 秒再扫下一轮（游戏后台流式加载数据需要时间）；
+            // 期间每 5 秒检查 scan_now 触发文件，避免用户等待过久。
+            for (int i = 0; i < 24; i++) {  // 24×5=120 秒
+                sleep(5);
+                FILE *t = fopen("/sdcard/Download/scan_now", "rb");
+                if (t) {
+                    fclose(t);
+                    remove("/sdcard/Download/scan_now");
+                    scan_memory_for_korean("手动触发(scan_now)");
+                }
             }
         }
     }).detach();
-    LOGI("【内存扫描】扫描线程已启动（90 秒后自动扫一次；扫描期间可在共享目录新建 scan_now 文件随时触发）");
+    LOGI("【内存扫描】扫描线程已启动（90 秒后首次扫描，此后每 120 秒自动扫描；"
+         "共享目录新建 scan_now 文件可随时触发）");
 }
 
 // ==================== runtime_invoke 监控（定位剧情加载函数）====================
