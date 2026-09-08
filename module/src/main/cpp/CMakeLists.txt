@@ -51,3 +51,26 @@ if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
             COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${MODULE_NAME}.so")
 endif ()
+
+# ============================================================
+# 免 root 独立注入库 libhack.so —— 打进重打包 APK 的 lib/arm64-v8a/，
+# 由 HackProvider（ContentProvider）在 Application 启动前 System.loadLibrary。
+# 仅构建 arm64：游戏官方 split 即 arm64-only；x86 模拟器由 NativeBridge
+# 自动转译加载（与游戏自带 .so 同理），无需 x86 变体。
+# HACK_STANDALONE 宏：排除 hack.cpp 末尾 root/NativeBridge 专用的 JNI_OnLoad，
+# 改用 standalone_entry.cpp 提供的入口。
+# ============================================================
+if (ANDROID_ABI STREQUAL "arm64-v8a")
+    add_library(hack SHARED
+            standalone_entry.cpp
+            hack.cpp
+            il2cpp_dump.cpp
+            ${xdl-src})
+    target_link_libraries(hack dobby log android)
+    target_compile_definitions(hack PRIVATE HACK_STANDALONE)
+
+    if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_custom_command(TARGET hack POST_BUILD
+                COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libhack.so")
+    endif ()
+endif ()
