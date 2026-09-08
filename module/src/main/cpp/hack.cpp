@@ -7,7 +7,9 @@
 //      TextMeshProUGUI/TextMeshPro 子类重写 set_text（名字牌/图鉴名实际走的
 //      路径，2026-09-07 实测基类被虚分派绕过）、TMP_Text.SetText 内部方法、
 //      UnityEngine.UI.Text.set_text。查 string_data.txt 字典：整句精确 →
-//      去标签/空白归一化 → 术语逐词替换（数字/标点保留）。
+//      去标签/空白归一化 → 术语逐词替换（数字/标点保留）→ 数字+单位词转换
+//      （2026년 9월 7일 → 2026年 9月 7日）。字典支持热重载：外部修改
+//      string_data.txt 后 5 秒内自动生效，无需重启游戏。
 //   2. 韩文采集（增量）：set_text 钩子 + il2cpp_string_new / il2cpp_string_new_utf16
 //      全量捕获网。任何托管字符串（含原生 AssetBundle 反序列化直接构造的）
 //      创建时若含谚文，一律去重落盘 captured_korean.txt，供离线批量翻译。
@@ -45,10 +47,13 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <shared_mutex>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdlib>
@@ -182,6 +187,9 @@ std::unordered_map<std::string, std::string> translation_map;
 // 术语表：从字典抽取的纯谚文短词（人名/UI词，2~8音节），用于整句未命中时
 // 的逐词替换（数字/标点/标签原样保留），解决"活动还剩3天16小时"这类模板文本。
 std::unordered_map<std::string, std::string> term_map;
+// 字典锁：热重载（写）与翻译查找（读）并发。读路径用 shared_lock，重载用
+// unique_lock；锁只护 map 访问，严禁在持锁状态下调用 origin/创建字符串。
+static std::shared_mutex g_dict_mutex;
 std::unordered_set<std::string> captured_kr_texts;
 static std::mutex capture_mutex;  // set_text 可能被游戏多线程并发调用
 
@@ -197,9 +205,24 @@ static int hangul_at(const char *s, size_t i, size_t n) {
     return 0;
 }
 
-// 查找用归一化：去掉富文本标签 <...> 与首尾空白。剧情人名同一位置忽译忽不译，
-// 根因是两次 set_text 传入的串一个带 <color>/<size> 标签或尾随空格、一个不带，
-// 整串精确匹配只中一次。归一化后内容一致即可稳定命中。
+// 前置声明：定义在内存扫描区（L641 附近），归一化/扫描共用
+static int utf8_decode_one(const uint8_t *p, const uint8_t *e, uint32_t &cp);
+
+// 首尾装饰性字符判定（emoji/符号/变体选择器等）。游戏文本常带前缀装饰如
+// "🍬접속 시..."，归一化时剥掉，让干净字典键也能命中。
+static bool is_trim_decor(uint32_t cp) {
+    if (cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n') return true;
+    if (cp == '&' || cp == '*' || cp == '~' || cp == '^' || cp == 0xB7) return true;
+    if (cp == 0xFE0F || cp == 0x200D || cp == 0x200C || cp == 0xFEFF) return true; // 变体/ZWJ/BOM
+    if (cp >= 0x1F000 && cp <= 0x1FAFF) return true;                               // emoji 主区
+    if (cp >= 0x2600 && cp <= 0x27BF) return true;                                 // 杂项符号/装饰箭头
+    if (cp >= 0x1F100 && cp <= 0x1F1FF) return true;                               // 包围字母数字
+    return false;
+}
+
+// 查找用归一化：去掉富文本标签 <...>、首尾空白与装饰字符。剧情人名同一位置
+// 忽译忽不译，根因是两次 set_text 传入的串一个带 <color>/<size> 标签或尾随
+// 空格、一个不带；邮件标题带 🍬/& 前缀。归一化后内容一致即可稳定命中。
 static std::string normalize_for_lookup(const std::string &s) {
     std::string out;
     out.reserve(s.size());
@@ -209,10 +232,24 @@ static std::string normalize_for_lookup(const std::string &s) {
         if (c == '>') { intag = false; continue; }
         if (!intag) out.push_back(c);
     }
-    size_t b = out.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return "";
-    size_t e = out.find_last_not_of(" \t\r\n");
-    return out.substr(b, e - b + 1);
+    // 首尾按码点剥装饰
+    size_t b = 0, n = out.size();
+    while (b < n) {
+        uint32_t cp; int w = utf8_decode_one((const uint8_t *)out.data() + b, (const uint8_t *)out.data() + n, cp);
+        if (w == 0 || !is_trim_decor(cp)) break;
+        b += w;
+    }
+    size_t e = n;
+    while (e > b) {
+        // 回退到上一个完整 UTF-8 序列起点
+        size_t p = e - 1;
+        while (p > b && ((unsigned char)out[p] & 0xC0) == 0x80) p--;
+        uint32_t cp; int w = utf8_decode_one((const uint8_t *)out.data() + p, (const uint8_t *)out.data() + e, cp);
+        if (w == 0 || !is_trim_decor(cp)) break;
+        e = p;
+    }
+    if (b >= e) return "";
+    return out.substr(b, e - b);
 }
 
 // 常见谚文助词（替换术语时连带省略，中文不需要）
@@ -251,6 +288,28 @@ static bool apply_terms(std::string &s) {
             }
         }
         if (!replaced) out += run;
+    }
+    // 数字+单位词直转：紧跟在 ASCII 数字后的单音节单位词无歧义（년=年/월=月/
+    // 일=日/시=时/분=分），术语表不收单音节词（太容易误替换），这里做定点替换。
+    // "발송 일자: 2026년 9월 7일" → "발송 일자: 2026年 9月 7日"
+    for (size_t i = 0; i + 3 < out.size(); i++) {
+        if (out[i] < '0' || out[i] > '9') continue;
+        // 跳过连续数字
+        size_t d = i;
+        while (d < out.size() && out[d] >= '0' && out[d] <= '9') d++;
+        if (d + 3 > out.size()) { i = d; continue; }
+        const unsigned char u0 = (unsigned char)out[d], u1 = (unsigned char)out[d+1], u2 = (unsigned char)out[d+2];
+        const char *zh = nullptr;
+        if (u0==0xEB && u1==0x85 && u2==0x84) zh = "年";      // 년
+        else if (u0==0xEC && u1==0x9B && u2==0x94) zh = "月";  // 월
+        else if (u0==0xEC && u1==0x9D && u2==0xBC) zh = "日";  // 일
+        else if (u0==0xEC && u1==0x8B && u2==0x9C) zh = "时";  // 시
+        else if (u0==0xEB && u1==0xB6 && u2==0x84) zh = "分";  // 분
+        if (zh) {
+            out.replace(d, 3, zh);
+            changed = true;
+        }
+        i = d;
     }
     if (changed) s.swap(out);
     return changed;
@@ -298,10 +357,15 @@ static std::string unescape_newlines(std::string s) {
     return s;
 }
 
-void load_translation_dict() {
-    std::string path = "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/string_data.txt";
-    std::ifstream file(path);
-    if (!file.is_open()) { LOGI("【汉化提示】未能打开字典文件！"); return; }
+#define DICT_PATH "/storage/emulated/0/Android/data/com.epidgames.trickcalrevive/files/string_data.txt"
+
+// 解析字典文件并重建两张表。调用方必须已持有 g_dict_mutex 写锁（或启动期无并发）。
+// 返回读入的词条数。
+static int load_dict_unlocked() {
+    translation_map.clear();
+    term_map.clear();
+    std::ifstream file(DICT_PATH);
+    if (!file.is_open()) { LOGI("【汉化提示】未能打开字典文件！"); return 0; }
     std::string line;
     int count = 0;
     while (std::getline(file, line)) {
@@ -313,6 +377,7 @@ void load_translation_dict() {
         if (pos != std::string::npos) {
             std::string key = unescape_newlines(line.substr(0, pos));
             std::string val = unescape_newlines(line.substr(pos + 1));
+            if (key.empty()) continue;
             translation_map[key] = val;
             count++;
             // 纯谚文短词（2~8 音节、无空格/标点/标签）进术语表，供逐词替换
@@ -328,8 +393,38 @@ void load_translation_dict() {
         }
     }
     file.close();
+    return count;
+}
+
+void load_translation_dict() {
+    std::unique_lock<std::shared_mutex> lk(g_dict_mutex);
+    int count = load_dict_unlocked();
     LOGI("【汉化提示】字典加载成功！共读入 %d 条翻译词条（含 %d 个术语短词）。",
          count, (int)term_map.size());
+}
+
+// 字典热重载监视线程：每 5 秒检查 string_data.txt 的 mtime/size，变化即重载。
+// 这样"改字典 → adb push → 游戏内 5 秒生效"，无需重启游戏。
+static void start_dict_watcher() {
+    std::thread([]{
+        struct stat st{};
+        bool have = (stat(DICT_PATH, &st) == 0);
+        time_t mt = have ? st.st_mtime : 0;
+        off_t sz = have ? st.st_size : 0;
+        while (true) {
+            sleep(5);
+            struct stat cur{};
+            if (stat(DICT_PATH, &cur) != 0) continue;
+            if (!have || cur.st_mtime != mt || cur.st_size != sz) {
+                mt = cur.st_mtime; sz = cur.st_size; have = true;
+                std::unique_lock<std::shared_mutex> lk(g_dict_mutex);
+                int n = load_dict_unlocked();
+                LOGI("【字典】检测到 string_data.txt 更新，热重载完成：%d 条（含 %d 个术语短词）",
+                     n, (int)term_map.size());
+            }
+        }
+    }).detach();
+    LOGI("【字典】热重载监视线程已启动（每 5 秒检查一次文件变动）");
 }
 
 // 启动时预加载已捕获的韩文，避免重启后重复写入
@@ -421,6 +516,8 @@ static bool record_captured_korean(const char16_t *chars, int32_t len, const cha
 
 // 第一次捕获到韩文时，打印调用栈
 static bool callstack_printed = false;
+// 翻译匹配总次数（日志限流用）
+static std::atomic<int> g_match_count{0};
 
 using set_text_fn = void (*)(void *__this, MyIl2CppString *il2cpp_string);
 
@@ -456,28 +553,37 @@ static void process_and_forward(void *__this, MyIl2CppString *il2cpp_string, set
             record_captured_korean(il2cpp_string->chars, il2cpp_string->length, "文本捕获");
         }
 
-        // 查字典翻译：① 原文精确匹配；② 去标签/空白后归一化匹配（治人名忽译
-        // 忽不译）；③ 整句未命中时逐词替换术语（治"3天16小时"这类带数字模板）。
+        // 查字典翻译：① 原文精确匹配；② 去标签/空白/装饰后归一化匹配（治人名
+        // 忽译忽不译、邮件标题带 🍬 前缀）；③ 整句未命中时逐词替换术语 +
+        // 数字+单位词转换（治"3天16小时""2026년 9월 7일"这类模板）。
+        // 锁只护 map 读取，在调用 origin / 创建字符串前已释放。
         std::string translated;
         bool matched = false;
-        auto it = translation_map.find(original_text);
-        if (it == translation_map.end()) {
-            std::string norm = normalize_for_lookup(original_text);
-            if (!norm.empty() && norm != original_text) {
-                auto jt = translation_map.find(norm);
-                if (jt != translation_map.end()) it = jt;
+        {
+            std::shared_lock<std::shared_mutex> lk(g_dict_mutex);
+            auto it = translation_map.find(original_text);
+            if (it == translation_map.end()) {
+                std::string norm = normalize_for_lookup(original_text);
+                if (!norm.empty() && norm != original_text) {
+                    auto jt = translation_map.find(norm);
+                    if (jt != translation_map.end()) it = jt;
+                }
             }
-        }
-        if (it != translation_map.end()) {
-            translated = it->second; matched = true;
-        } else if (contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
-            std::string tmp = original_text;
-            if (apply_terms(tmp)) { translated = tmp; matched = true; }
+            if (it != translation_map.end()) {
+                translated = it->second; matched = true;
+            } else if (contains_korean(il2cpp_string->chars, il2cpp_string->length)) {
+                std::string tmp = original_text;
+                if (apply_terms(tmp)) { translated = tmp; matched = true; }
+            }
         }
         if (matched && il2cpp_string_new_ptr != nullptr) {
             MyIl2CppString *new_string = il2cpp_string_new_ptr(translated.c_str());
             if (new_string != nullptr) {
-                LOGI("【汉化匹配】%s -> %s", original_text.c_str(), translated.c_str());
+                // 匹配日志限流：字典大了之后每次匹配都打会刷爆 logcat。
+                // 前 200 条逐条打，之后每 1000 条打 1 条。
+                int n = ++g_match_count;
+                if (n <= 200 || n % 1000 == 0)
+                    LOGI("【汉化匹配】%s -> %s（第 %d 次）", original_text.c_str(), translated.c_str(), n);
                 return origin(__this, new_string);
             }
         }
@@ -727,12 +833,13 @@ static void scan_region_utf16le(const uint8_t *p, size_t len,
     flush();
 }
 
-static void scan_memory_for_korean(const char *why) {
+// 扫描所有可写映射提取韩文。返回本轮新增总数；out_utf8/out_utf16 可选带回分项。
+static int scan_memory_for_korean(const char *why, int *out_utf8 = nullptr, int *out_utf16 = nullptr) {
     LOGI("【内存扫描】开始（%s）...", why);
     FILE *mf = fopen("/proc/self/maps", "r");
-    if (!mf) { LOGI("【内存扫描】无法打开 /proc/self/maps，放弃"); return; }
+    if (!mf) { LOGI("【内存扫描】无法打开 /proc/self/maps，放弃"); return 0; }
     FILE *batch = fopen("/sdcard/Download/captured_korean.txt", "a");
-    if (!batch) { fclose(mf); LOGI("【内存扫描】无法打开输出文件，放弃"); return; }
+    if (!batch) { fclose(mf); LOGI("【内存扫描】无法打开输出文件，放弃"); return 0; }
     setvbuf(batch, nullptr, _IONBF, 0);
 
     char line[1024];
@@ -773,34 +880,44 @@ static void scan_memory_for_korean(const char *why) {
     fclose(mf);
     LOGI("【内存扫描】完成（%s）：区域 %d 个，扫描 %zu MB，新增 UTF-8 %d 条 + UTF-16 %d 条",
          why, regions, scanned >> 20, fresh_utf8, fresh_utf16);
+    if (out_utf8) *out_utf8 = fresh_utf8;
+    if (out_utf16) *out_utf16 = fresh_utf16;
+    return fresh_utf8 + fresh_utf16;
 }
 
-// 扫描线程：90 秒后首次自动扫；此后每 120 秒自动扫一次（捕获后续加载的
-// 数据），同时每 5 秒检查 scan_now 触发文件。每次扫描都走全量去重，
+// 扫描线程：90 秒后首次自动扫；自动轮间隔自适应——收益大（新数据多）保持
+// 120 秒，收益小则逐倍退避至 30 分钟，避免游戏期周期性 CPU 尖峰。手动
+// scan_now 触发不受间隔影响，且会把自动轮拉回高频。每次扫描都走全量去重，
 // 已有条目不会重复写入——只增不丢。
 static void start_memory_scanner() {
     std::thread([]{
         sleep(90);
         int round = 0;
+        int interval = 120;  // 自动轮间隔（秒），自适应调整
         while (true) {
             round++;
             char why[64];
             snprintf(why, sizeof(why), "自动第%d轮", round);
-            scan_memory_for_korean(why);
-            // 等 120 秒再扫下一轮（游戏后台流式加载数据需要时间）；
-            // 期间每 5 秒检查 scan_now 触发文件，避免用户等待过久。
-            for (int i = 0; i < 24; i++) {  // 24×5=120 秒
+            int fresh_utf8 = 0, fresh_utf16 = 0;
+            int fresh = scan_memory_for_korean(why, &fresh_utf8, &fresh_utf16);
+            if (fresh >= 1000) interval = 120;                 // 收益大：保持高频
+            else if (fresh > 0) { /* 收益一般：保持当前间隔 */ }
+            else interval = interval * 2 < 1800 ? interval * 2 : 1800;  // 零收益：退避
+            // 期间每 5 秒检查 scan_now 触发文件；任何手动触发后回到高频
+            int ticks = interval / 5;
+            for (int i = 0; i < ticks; i++) {
                 sleep(5);
                 FILE *t = fopen("/sdcard/Download/scan_now", "rb");
                 if (t) {
                     fclose(t);
                     remove("/sdcard/Download/scan_now");
                     scan_memory_for_korean("手动触发(scan_now)");
+                    interval = 120;
                 }
             }
         }
     }).detach();
-    LOGI("【内存扫描】扫描线程已启动（90 秒后首次扫描，此后每 120 秒自动扫描；"
+    LOGI("【内存扫描】扫描线程已启动（90 秒后首次扫描；间隔随收益自适应 120 秒~30 分钟；"
          "共享目录新建 scan_now 文件可随时触发）");
 }
 
@@ -982,9 +1099,10 @@ void hack_start(const char *game_data_dir) {
             else
                 LOGI("【错误】未能绑定 il2cpp_string_new");
 
-            // 一次性任务：加载翻译字典 + 预加载已捕获文本（去重）
+            // 一次性任务：加载翻译字典 + 预加载已捕获文本（去重）+ 字典热重载监视
             load_translation_dict();
             preload_captured_texts();
+            start_dict_watcher();
 
             // 全量韩文捕获网：hook 字符串创建 API 的【真实实现】（版本无关）。
             // 任何托管字符串（含原生 AssetBundle 反序列化直接构造的）都要经过
@@ -1332,11 +1450,18 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 #endif
 }
 
+// root 版（Zygisk / NativeBridge 流程）需要本 JNI_OnLoad：x86 模拟器上 arm
+// 桥接库被 NativeBridgeLoad 以 getTrampoline("JNI_OnLoad") 方式调用，reserved
+// 携带 game_data_dir。免 root 独立版由 standalone_entry.cpp 提供自己的
+// JNI_OnLoad（System.loadLibrary 时 reserved 为 null，且需更早装 exit blocker、
+// 释放 assets 字典），此时用 HACK_STANDALONE 排除本实现避免符号冲突。
 #if defined(__arm__) || defined(__aarch64__)
+#ifndef HACK_STANDALONE
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *)reserved;
     std::thread hack_thread(hack_start, game_data_dir);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
+#endif
 #endif
