@@ -113,7 +113,18 @@ static void extract_bundled_dict(JNIEnv *env) {
         return;
     }
 
-    // 确保目标目录存在（GameDictPath 的父目录）
+    // 关键：Android 11+ 上 app 自己 mkdir /sdcard/Android/data/<pkg> 会被
+    // FUSE 拒绝（EACCES），必须通过 Context.getExternalFilesDir(null) 让
+    // 系统服务创建该目录（返回路径就是 GameDictPath 的父目录）。
+    jmethodID get_efs = env->GetMethodID(ctx_clz, "getExternalFilesDir",
+                                         "(Ljava/lang/String;)Ljava/io/File;");
+    if (get_efs) {
+        jobject efs = env->CallObjectMethod(app, get_efs, (jstring) nullptr);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (efs) LOGI("【独立注入】外部 files 目录已就绪。");
+    }
+
+    // 兜底：再 mkdir -p 一次（旧系统或内部目录场景）
     char dir[512];
     snprintf(dir, sizeof(dir), "%s", GameDictPath);
     char *slash = strrchr(dir, '/');
