@@ -135,36 +135,5 @@ def main():
     # ---- 短路 G-Presto 反篡改结果回调（Error_1100 弹窗/退出） ----
     patch_presto_callback(root)
 
-    # ---- 诊断：dump Bishopsoft Presto SDK + Unity 胶水层 smali 到 CI 日志 ----
-    print("=" * 60)
-    print("[diag] 扫描并打印 Presto/反篡改/胶水 smali：")
-    glue_markers = ("MSG_GPresto", "GPresto", "Presto/SDK/Presto;->",
-                    "Presto/SDK/Presto;", "Illicit", "HealthCheckTest")
-    dumped = 0
-    for dp, dn, fn in os.walk(root):
-        rel = os.path.relpath(dp, root).replace("\\", "/")
-        for f in fn:
-            if not f.endswith(".smali"):
-                continue
-            path = os.path.join(dp, f)
-            disp = path.replace(root + os.sep, "").replace("\\", "/")
-            if "bishopsoft" in disp:
-                want = True
-            else:
-                try:
-                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                        head = fh.read()
-                except OSError:
-                    continue
-                want = any(k in head for k in glue_markers)
-            if not want:
-                continue
-            print(f"\n########## SMALI FILE: {disp} ##########")
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                txt = fh.read()
-            print(txt[:20000])
-            dumped += 1
-    print(f"[diag] 共 dump {dumped} 个 Presto/胶水 smali 文件")
-
 if __name__ == "__main__":
     main()
