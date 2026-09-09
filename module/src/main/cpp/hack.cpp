@@ -159,7 +159,15 @@ static int my_tgkill(int tgid, int tid, int sig) {
     return old_tgkill(tgid, tid, sig);
 }
 
+// 一次性护栏：独立注入版 JNI_OnLoad 提前装一次、hack_start 内又装一次；
+// 重复 DobbyHook 同一函数会覆盖/踩踏已安装的补丁。
+static bool g_exit_blocker_installed = false;
 void hook_exit_functions() {
+    if (g_exit_blocker_installed) {
+        LOGI("【Hook】Exit blocker 已安装过，跳过重复挂钩。");
+        return;
+    }
+    g_exit_blocker_installed = true;
     void *libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
     if (libc != nullptr) {
         void *exit_sym = dlsym(libc, "exit");
