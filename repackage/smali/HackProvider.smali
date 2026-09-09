@@ -2,12 +2,12 @@
 .super Landroid/content/ContentProvider;
 
 #
-# 免 root 汉化注入点：ContentProvider 在 Application.onCreate 之前由系统
-# 实例化（attachBaseContext 之后、Presto Loader 初始化之前），是免修改
-# 原有类前提下最早的可控执行点。onCreate 里 System.loadLibrary("hack")
-# 加载 libhack.so，其 JNI_OnLoad 会立即安装 exit blocker 并启动翻译线程。
-#
-# 任何异常都吞掉并返回 true：加载失败也绝不能拖垮游戏启动。
+# [DIAG v7] 诊断构建：onCreate 只返回 true，故意不 System.loadLibrary("hack")。
+# 整个包依旧重签/合并split/neutralize/split-strip/provider声明，但运行时
+# 不加载 libhack、不安装任何 hook。
+#   - 若仍弹 Error_1100 => 触发点是静态（重签名/DEX/新增文件），与运行时 hook 无关
+#   - 若游戏正常 => 触发点是 libhack 加载或 Dobby inline hook
+# 诊断后需把此文件还原为 loadLibrary 版本。
 #
 
 .method public constructor <init>()V
@@ -19,33 +19,12 @@
 .end method
 
 .method public onCreate()Z
-    .registers 4
+    .registers 3
 
-    :try_start
-    const-string v1, "chopperhl"
-    const-string v2, "HackProvider onCreate: loading libhack.so ..."
-    invoke-static {v1, v2}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+    const-string v0, "chopperhl"
+    const-string v1, "HackProvider DIAG: onCreate WITHOUT loadLibrary (no hooks running)"
+    invoke-static {v0, v1}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
 
-    const-string v0, "hack"
-    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
-
-    const-string v2, "HackProvider onCreate: libhack.so loaded OK"
-    invoke-static {v1, v2}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
-    :try_end
-    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch_0
-
-    goto :goto_0
-
-    :catch_0
-    move-exception v0
-
-    invoke-virtual {v0}, Ljava/lang/Throwable;->printStackTrace()V
-
-    const-string v1, "chopperhl"
-    const-string v2, "HackProvider onCreate: loadLibrary FAILED (game continues anyway)"
-    invoke-static {v1, v2}, Landroid/util/Log;->e(Ljava/lang/String;Ljava/lang/String;)I
-
-    :goto_0
     const/4 v0, 0x1
 
     return v0
