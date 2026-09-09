@@ -58,6 +58,21 @@ void il2cpp_api_init(void *handle) {
         LOGE("Failed to initialize il2cpp api.");
         return;
     }
+    // 安全门：libil2cpp.so 被 dlopen 的瞬间 Unity 还在初始化 il2cpp，
+    // 此时 s_Il2CppDomain 还是空、线程表也未建立。直接调 il2cpp_is_vm_thread
+    // 会在内部空指针解引用（实测独立注入版 T+1.5s 进入，主线程 libunity 侧
+    // SIGSEGV）。必须先轮询等到 il2cpp_domain_get() 返回非空（runtime init
+    // 完成）再调用线程相关 API。
+    int wait = 0;
+    while (!(il2cpp_domain_get && il2cpp_domain_get())) {
+        if (++wait > 300) {
+            LOGE("il2cpp domain 等待超时（300s），放弃初始化。");
+            return;
+        }
+        LOGI("Waiting for il2cpp domain... (%d)", wait);
+        sleep(1);
+    }
+    LOGI("il2cpp domain ready (after %d s).", wait);
     while (!il2cpp_is_vm_thread(nullptr)) {
         LOGI("Waiting for il2cpp_init...");
         sleep(1);
