@@ -7,7 +7,7 @@ name: Repackage CN APK
 #      （需先在仓库 Releases 发布一个标签，比如 apk，上传这两个文件）
 #   3. apktool 反编译 base → 合并 split 的 arm64 原生库
 #      → 注入 libhack.so / 字典 assets / HackProvider.smali / Manifest 声明
-#      → 重打包 → zipalign → apksigner 签名
+#      → 重打包 → 二进制去 split 声明 → zipalign → apksigner 签名
 #   4. 产出 trickcal-revive-cn.apk 为 workflow artifact
 # ============================================================
 on:
@@ -129,6 +129,17 @@ jobs:
           java -jar apktool.jar b decoded -o trickcal-cn-unsigned.apk
           ls -la trickcal-cn-unsigned.apk
 
+      - name: Strip Play split declarations from compiled manifest (binary patch)
+        run: |
+          # apktool/aapt 回编译会复活 requiredSplitTypes/splitTypes 及
+          # com.android.vending.splits[.required] meta-data，甚至自行补
+          # isSplitRequired，装到设备上就是 INSTALL_FAILED_MISSING_SPLIT。
+          # 直接在最终二进制 AXML 字符串池里把这些名字原地改成等长乱码
+          # （偏移/长度不变），包管理器按名查不到即忽略。脚本自带残留校验，
+          # 有残留会以非零码退出导致流水线失败。
+          python3 repackage/patch_manifest_apk.py trickcal-cn-unsigned.apk trickcal-cn-nosplit.apk
+          mv -f trickcal-cn-nosplit.apk trickcal-cn-unsigned.apk
+
       - name: zipalign + sign (v1+v2+v3, self-signed)
         run: |
           "$BT/zipalign" -f -p 4 trickcal-cn-unsigned.apk trickcal-cn-aligned.apk
@@ -148,6 +159,13 @@ jobs:
         run: |
           unzip -l trickcal-revive-cn.apk | grep -E 'libhack\.so|string_data\.txt|classes.*\.dex' | head -20
           unzip -l trickcal-revive-cn.apk | grep -c 'lib/arm64-v8a/.*\.so'
+          echo '--- split declarations must be neutralized (expect NOT FOUND) ---'
+          if unzip -p trickcal-revive-cn.apk AndroidManifest.xml | strings | grep -E 'requiredSplitTypes|isSplitRequired|com.android.vending.splits' ; then
+            echo 'FATAL: split declarations still present in manifest'
+            exit 1
+          else
+            echo 'OK: split declarations not found in final manifest'
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
