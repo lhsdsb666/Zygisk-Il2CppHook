@@ -30,6 +30,65 @@ PATTERNS = [
     ("Process.killProcess",re.compile(r'^\s*invoke-static\s+\{[^}]*\},\s*Landroid/os/Process;->killProcess\(I\)V\s*$')),
 ]
 
+def in_smali_dir(rel):
+    """rel 是相对反编译根目录的路径；判断是否位于 smali/ 或 smali_classesN/ 下。"""
+    rel = rel.replace("\\", "/")
+    return rel == "smali" or rel.startswith("smali/") or \
+        bool(re.match(r"smali_classes\d+(?:/|$)", rel))
+
+
+def patch_presto_callback(root):
+    """短路 G-Presto(libATG_L) 反篡改的结果回调。
+
+    检测链（已从 smali 确认）：
+      UnityPlayerActivity.Presto_Init() 启动 native 引擎；
+      native 检测到重签名后，经 JNI 回调
+        UnityPlayerActivity.Result_Scanning(String fullMsg, int code,
+                                            String scanName, String msg)
+      该方法把 msg(资源名, 如 MSG_GPresto_REPACKAGING) 解析成字符串资源 id，
+      拼出 "[Error_1100] ..."，再 post 到 Handler -> UnitySendMessage 通知
+      C# 弹"非正常环境/8秒后关闭"框并退出。
+
+    把 Result_Scanning 方法体整体替换为 return-void：native 照常初始化、照常
+    检测、照常回调，但回调掉进空槽——不拼错误串、不 post Handler、不发 Unity
+    消息，C# 永远收不到判定，不弹窗、不倒计时、不退出。方法签名保留（native
+    GetMethodID 仍能找到），只是什么都不做。
+    """
+    print("=" * 60)
+    print("[patch] 短路 G-Presto Result_Scanning 反篡改回调：")
+    sig = r"Result_Scanning\(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;\)V"
+    method_rx = re.compile(
+        r"(\.method[^\n]*\b" + sig + r"\s*\r?\n).*?(\r?\n\.end method)",
+        re.DOTALL)
+    patched = 0
+    for dp, dn, fn in os.walk(root):
+        rel = os.path.relpath(dp, root)
+        if not in_smali_dir(rel):
+            continue
+        for f in fn:
+            if f != "UnityPlayerActivity.smali":
+                continue
+            path = os.path.join(dp, f)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
+            new_body = ("\n    .locals 0\n\n"
+                        "    # [cn-repack] G-Presto anti-tamper result swallowed\n"
+                        "    return-void\n")
+            new_txt, n = method_rx.subn(
+                lambda m: m.group(1) + new_body + m.group(2), txt, count=1)
+            if n:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(new_txt)
+                disp = path.replace(root + os.sep, "").replace("\\", "/")
+                print(f"  [ok] {disp}: Result_Scanning -> return-void")
+                patched += 1
+    if patched == 0:
+        print("  [warn] 未找到 Result_Scanning 方法（请检查反编译产物）")
+    else:
+        print(f"  共短路 {patched} 处 Result_Scanning 回调")
+    return patched
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "decoded"
     total = {name: 0 for name, _ in PATTERNS}
@@ -72,6 +131,9 @@ def main():
     print(f"  共修改 {files_changed} 个 smali 文件")
     if files_changed == 0:
         print("[warn] 未发现任何 exit/halt/killProcess 调用点（请确认反编译目录正确）")
+
+    # ---- 短路 G-Presto 反篡改结果回调（Error_1100 弹窗/退出） ----
+    patch_presto_callback(root)
 
     # ---- 诊断：dump Bishopsoft Presto SDK + Unity 胶水层 smali 到 CI 日志 ----
     print("=" * 60)
