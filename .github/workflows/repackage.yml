@@ -4,9 +4,9 @@ name: Repackage CN APK
 # 免 root 汉化整合包流水线：
 #   1. Gradle 编译原生库（Zygisk 模块 + 免 root 独立注入库 libhack.so）
 #   2. 从 Release 资产下载原版 base.apk 与 split_config.arm64_v8a.apk
-#      （需先在仓库 Releases 发布一个标签，比如 apk，上传这两个文件）
 #   3. apktool 反编译 base → 合并 split 的 arm64 原生库
 #      → 注入 libhack.so / 字典 assets / HackProvider.smali / Manifest 声明
+#      → smali 中和 Java 层自杀调用（反篡改）
 #      → 重打包 → 二进制去 split 声明 → zipalign → apksigner 签名
 #   4. 产出 trickcal-revive-cn.apk 为 workflow artifact
 # ============================================================
@@ -123,6 +123,13 @@ jobs:
         run: |
           python3 repackage/inject_manifest.py decoded/AndroidManifest.xml
           grep -A2 HackProvider decoded/AndroidManifest.xml || true
+
+      - name: Neutralize Java-level self-exit calls (anti-tamper)
+        run: |
+          # 反篡改检测到重签名后会在 Java 层 System.exit(0) 静默杀进程
+          # （x86 ART 走系统 libc，arm64 翻译层的 native exit hook 拦不到）。
+          # 在 smali 层移除 System.exit/Runtime.exit/VMRuntime.halt/killProcess 调用点。
+          python3 repackage/neutralize_exit.py decoded
 
       - name: Rebuild APK (apktool b)
         run: |
