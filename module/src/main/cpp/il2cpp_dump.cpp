@@ -26,8 +26,8 @@
 
 
 #include "dobby.h"
+#include <atomic>
 static uint64_t il2cpp_base = 0;
-
 
 void il2cpp_dump();
 
@@ -44,6 +44,38 @@ void init_il2cpp_api(void *handle) {
 #undef DO_API
 }
 
+// =============================================================================
+// 就绪检测：hook il2cpp 运行时的初始化入口。
+//
+// 【为什么不能轮询 API】libil2cpp.so 刚被 dlopen（其 JNI_OnLoad 阶段）时，
+// 运行时全局状态（domain、线程表、TLS）全为空。此时外部线程直接调用
+// il2cpp_domain_get() / il2cpp_is_vm_thread() 会在库内部空指针解引用
+// SIGSEGV（实测两次：v3 在 libunity.so 侧崩，v4 在 libil2cpp.so 内崩）。
+// 所以不能用"调 API 探测"的方式等就绪。
+//
+// 【做法】libunity 启动时必定调用 il2cpp_init / il2cpp_init_utf16 完成
+// 运行时初始化。我们在库一映射就 hook 这两个入口（只改代码、不调用任何
+// il2cpp 函数），初始化在 Unity 主线程完成后回调置位，工作线程被唤醒后
+// 再做 domain_get / thread_attach，此时一切安全。
+// =============================================================================
+static std::atomic<bool> g_il2cpp_runtime_ready{false};
+typedef int (*il2cpp_init_fn)(const char *);
+typedef int (*il2cpp_init_utf16_fn)(const Il2CppChar *);
+static il2cpp_init_fn        g_orig_il2cpp_init = nullptr;
+static il2cpp_init_utf16_fn  g_orig_il2cpp_init_u16 = nullptr;
+
+static int my_il2cpp_init(const char *domain_name) {
+    int r = g_orig_il2cpp_init ? g_orig_il2cpp_init(domain_name) : -1;
+    LOGI("【il2cpp】il2cpp_init 返回 %d —— 运行时初始化完成。", r);
+    g_il2cpp_runtime_ready = true;
+    return r;
+}
+static int my_il2cpp_init_utf16(const Il2CppChar *domain_name) {
+    int r = g_orig_il2cpp_init_u16 ? g_orig_il2cpp_init_u16(domain_name) : -1;
+    LOGI("【il2cpp】il2cpp_init_utf16 返回 %d —— 运行时初始化完成。", r);
+    g_il2cpp_runtime_ready = true;
+    return r;
+}
 
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
@@ -58,27 +90,44 @@ void il2cpp_api_init(void *handle) {
         LOGE("Failed to initialize il2cpp api.");
         return;
     }
-    // 安全门：libil2cpp.so 被 dlopen 的瞬间 Unity 还在初始化 il2cpp，
-    // 此时 s_Il2CppDomain 还是空、线程表也未建立。直接调 il2cpp_is_vm_thread
-    // 会在内部空指针解引用（实测独立注入版 T+1.5s 进入，主线程 libunity 侧
-    // SIGSEGV）。必须先轮询等到 il2cpp_domain_get() 返回非空（runtime init
-    // 完成）再调用线程相关 API。
+
+    // 安装就绪钩子（仅打补丁，不调用任何 il2cpp 运行时函数）
+    if (il2cpp_init) {
+        DobbyHook((void *) il2cpp_init, (void *) my_il2cpp_init,
+                  (void **) &g_orig_il2cpp_init);
+    }
+    if (il2cpp_init_utf16) {
+        DobbyHook((void *) il2cpp_init_utf16, (void *) my_il2cpp_init_utf16,
+                  (void **) &g_orig_il2cpp_init_u16);
+    }
+    LOGI("il2cpp_init 就绪钩子已安装: init=%d utf16=%d",
+         il2cpp_init ? 1 : 0, il2cpp_init_utf16 ? 1 : 0);
+
     int wait = 0;
-    while (!(il2cpp_domain_get && il2cpp_domain_get())) {
-        if (++wait > 300) {
-            LOGE("il2cpp domain 等待超时（300s），放弃初始化。");
-            return;
+    while (!g_il2cpp_runtime_ready.load()) {
+        if (++wait > 120) {
+            // 兜底：理论上注入极早时 il2cpp_init 可能在我们 hook 之前就已
+            // 调用完毕。超时后按"已就绪"尝试，domain_get 前再判空保护。
+            LOGE("等待 il2cpp_init 事件超时（120s），按运行时已就绪继续尝试。");
+            break;
         }
-        LOGI("Waiting for il2cpp domain... (%d)", wait);
+        if (wait == 1 || wait % 10 == 0)
+            LOGI("Waiting for il2cpp runtime init... (%d s)", wait);
         sleep(1);
     }
-    LOGI("il2cpp domain ready (after %d s).", wait);
-    while (!il2cpp_is_vm_thread(nullptr)) {
-        LOGI("Waiting for il2cpp_init...");
-        sleep(1);
+    if (g_il2cpp_runtime_ready.load()) {
+        LOGI("il2cpp runtime ready (init event after %d s).", wait);
+        sleep(2);  // 让 Unity 主线程走出 init 临界区
     }
+
+    // 运行时初始化已完成，以下调用安全
     auto domain = il2cpp_domain_get();
+    if (!domain) {
+        LOGE("il2cpp_domain_get() 返回空，放弃 hook 安装（游戏可正常运行，仅无汉化）。");
+        return;
+    }
     il2cpp_thread_attach(domain);
+    LOGI("工作线程已 attach 到 il2cpp domain=%p。", domain);
 }
 
 // =============================================================================
