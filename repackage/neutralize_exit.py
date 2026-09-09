@@ -73,26 +73,36 @@ def main():
     if files_changed == 0:
         print("[warn] 未发现任何 exit/halt/killProcess 调用点（请确认反编译目录正确）")
 
-    # ---- 诊断：dump Bishopsoft Presto SDK 的 smali 到 CI 日志（定位反篡改 bypass 点） ----
+    # ---- 诊断：dump Bishopsoft Presto SDK + Unity 胶水层 smali 到 CI 日志 ----
     print("=" * 60)
-    print("[diag] 扫描并打印 Presto/反篡改相关 smali：")
+    print("[diag] 扫描并打印 Presto/反篡改/胶水 smali：")
+    glue_markers = ("MSG_GPresto", "GPresto", "Presto/SDK/Presto;->",
+                    "Presto/SDK/Presto;", "Illicit", "HealthCheckTest")
     dumped = 0
     for dp, dn, fn in os.walk(root):
         rel = os.path.relpath(dp, root).replace("\\", "/")
-        norm = rel.replace("\\", "/")
-        interesting = ("bishopsoft/Presto" in norm or "/Presto" in norm)
         for f in fn:
             if not f.endswith(".smali"):
                 continue
             path = os.path.join(dp, f)
             disp = path.replace(root + os.sep, "").replace("\\", "/")
-            if "bishopsoft" in disp or "Presto" in f:
-                print(f"\n########## SMALI FILE: {disp} ##########")
-                with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                    txt = fh.read()
-                print(txt[:12000])
-                dumped += 1
-    print(f"[diag] 共 dump {dumped} 个 Presto smali 文件")
+            if "bishopsoft" in disp:
+                want = True
+            else:
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                        head = fh.read()
+                except OSError:
+                    continue
+                want = any(k in head for k in glue_markers)
+            if not want:
+                continue
+            print(f"\n########## SMALI FILE: {disp} ##########")
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
+            print(txt[:20000])
+            dumped += 1
+    print(f"[diag] 共 dump {dumped} 个 Presto/胶水 smali 文件")
 
 if __name__ == "__main__":
     main()
