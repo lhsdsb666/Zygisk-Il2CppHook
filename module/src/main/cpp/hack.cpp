@@ -159,7 +159,15 @@ static int my_tgkill(int tgid, int tid, int sig) {
     return old_tgkill(tgid, tid, sig);
 }
 
+// 一次性护栏：独立注入版 JNI_OnLoad 提前装一次、hack_start 内又装一次；
+// 重复 DobbyHook 同一函数会覆盖/踩踏已安装的补丁。
+static bool g_exit_blocker_installed = false;
 void hook_exit_functions() {
+    if (g_exit_blocker_installed) {
+        LOGI("【Hook】Exit blocker 已安装过，跳过重复挂钩。");
+        return;
+    }
+    g_exit_blocker_installed = true;
     void *libc = dlopen("libc.so", RTLD_NOW | RTLD_GLOBAL);
     if (libc != nullptr) {
         void *exit_sym = dlsym(libc, "exit");
@@ -1069,6 +1077,213 @@ bool install_hooks_by_name() {
     return tmp_done;
 }
 
+// ==================== 表解密探针（2026-09-16 重新加装）====================
+// 目的：抓表解密密码 / key / IV，打通静态解包（.client 解密 → 翻译 → 重加密）。
+// 背景：eti AES 链（SHA256(pw)+Base64 密钥派生 → AES-256-CFB8）已在 09-04 完全
+//   逆向，但密码 eti.hlyr 从未抓到；本版 hack.cpp 重构时探针代码被丢弃，现补回。
+// 四组探针全部失败安全：装不上 / 没触发都不影响翻译与韩文采集。
+//   A) eti.cntp(4参)  —— 密钥派生：SHA256(pw)+Base64 → key/IV（抓密码原文）
+//      失败自动降级试 3 参重载
+//   B) eti.cntj(1参)  —— 表文件解密入口：抓 path + 返回 MemoryStream 内容
+//   C) RijndaelManaged.CreateDecryptor —— BCL 兜底：标准库名不受混淆影响，
+//      参数即 key+IV（拿不到密码也能直接解密全部表）
+//   D) eti.cnto / bbm(1参) —— 密码入口包装，参数歧义最小
+// 注意：6000.3.13f1 全量重编译后混淆类名（eti 等）可能已变化；A/B/D 查找失败
+//   会打【探针】日志提示，C 探针不受影响。
+static std::mutex g_probe_io_mutex;
+static bool g_probes_done = false;          // 全部探针安装完成
+static std::unordered_set<uint64_t> g_rd_key_seen;
+static std::mutex g_rd_key_mutex;
+
+static void probe_dump_blob(const char *dir, const char *prefix,
+                            const void *data, size_t len) {
+    if (!data || !len) return;
+    mkdir("/sdcard/Download", 0777);
+    mkdir(dir, 0777);
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s_%lld_%zu.bin", dir, prefix,
+             (long long)time(nullptr), len);
+    std::lock_guard<std::mutex> lk(g_probe_io_mutex);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(data, 1, len, f); fclose(f); }
+}
+
+// IL2CPP String: 0x10=int32 length, 0x14=char16 data
+// IL2CPP Array : 0x18=int32 length, 0x20=data
+static bool probe_read_string(void *obj, char *out, size_t outsz) {
+    if (!obj) return false;
+    int32_t len = *(int32_t *)((char *)obj + 0x10);
+    if (len <= 0 || len >= 256) return false;
+    char16_t *chars = (char16_t *)((char *)obj + 0x14);
+    for (int i = 0; i < len; i++)
+        if (chars[i] >= 0x11000) return false;  // 参数布局误判防护
+    size_t n = 0;
+    for (int i = 0; i < len && n + 4 < outsz; i++) {
+        char16_t c = chars[i];
+        if (c >= 0x20 && c < 0x7F) out[n++] = (char)c;
+        else { out[n++] = '?'; }
+    }
+    out[n] = 0;
+    return true;
+}
+
+static bool probe_read_array(void *arr, uint8_t **data, int32_t *len) {
+    if (!arr) return false;
+    int32_t l = *(int32_t *)((char *)arr + 0x18);
+    if (l <= 0 || l > 4096) return false;      // key/IV 合理上限
+    *data = (uint8_t *)((char *)arr + 0x20);
+    *len = l;
+    return true;
+}
+
+// ---- 通用探针挂钩（参数个数可变，无 string 校验，静态类查找）----
+static bool hook_probe_method(const char *ns, const char *cls, const char *method_name,
+                              int argc, void *replace_func, void **origin_func) {
+    auto domain = il2cpp_domain_get();
+    if (!domain) return false;
+    size_t assembly_count = 0;
+    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &assembly_count);
+    if (!assemblies || assembly_count == 0) return false;
+    for (size_t i = 0; i < assembly_count; i++) {
+        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        Il2CppClass *klass = il2cpp_class_from_name(image, ns, cls);
+        if (!klass) continue;
+        const MethodInfo *method = il2cpp_class_get_method_from_name(klass, method_name, argc);
+        if (!method || !method->methodPointer) {
+            LOGI("【探针】找到 %s.%s 但 %s(%d参) 方法缺失", ns, cls, method_name, argc);
+            return false;
+        }
+        if (already_dobby_patched((void *)method->methodPointer)) return true;
+        if (DobbyHook((void *)method->methodPointer, replace_func, origin_func) != 0) {
+            LOGI("【探针】%s.%s.%s DobbyHook 失败", ns, cls, method_name);
+            return false;
+        }
+        LOGI("【成功】【探针】%s.%s.%s(%d参) 已挂钩 @ %p",
+             ns, cls, method_name, argc, method->methodPointer);
+        return true;
+    }
+    LOGI("【提示】【探针】未找到类 %s.%s（混淆名可能已随版本变更）", ns, cls);
+    return false;
+}
+
+// ---- A) eti.cntp：cntp(alg, pw, out key, out iv) / 3参降级 cntp(pw, out key, out iv)
+static void (*old_cntp4)(void *, void *, void **, void **, const MethodInfo *);
+static void my_cntp4(void *alg, void *pw, void **outKey, void **outIV, const MethodInfo *m) {
+    old_cntp4(alg, pw, outKey, outIV, m);
+    char s[256];
+    if (probe_read_string(pw, s, sizeof(s)))
+        LOGI("【密钥派生】eti.cntp pw=%s", s);
+    else
+        LOGI("【密钥派生】eti.cntp 触发（pw 参数布局异常，仅 dump key/IV）");
+    uint8_t *kd; int32_t kl;
+    if (outKey && probe_read_array(*outKey, &kd, &kl))
+        probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_eti_key", kd, kl);
+    if (outIV && probe_read_array(*outIV, &kd, &kl))
+        probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_eti_iv", kd, kl);
+    if (pw) probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_eti_pw",
+                            (char *)pw + 0x14,
+                            (size_t)*(int32_t *)((char *)pw + 0x10) * 2);
+}
+static void (*old_cntp3)(void *, void **, void **, const MethodInfo *);
+static void my_cntp3(void *pw, void **outKey, void **outIV, const MethodInfo *m) {
+    old_cntp3(pw, outKey, outIV, m);
+    char s[256];
+    if (probe_read_string(pw, s, sizeof(s)))
+        LOGI("【密钥派生】eti.cntp(3参) pw=%s", s);
+    uint8_t *kd; int32_t kl;
+    if (outKey && probe_read_array(*outKey, &kd, &kl))
+        probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_eti_key", kd, kl);
+    if (outIV && probe_read_array(*outIV, &kd, &kl))
+        probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_eti_iv", kd, kl);
+    if (pw) probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_eti_pw",
+                            (char *)pw + 0x14,
+                            (size_t)*(int32_t *)((char *)pw + 0x10) * 2);
+}
+
+// ---- B) eti.cntj(path) → MemoryStream：记 path + 带校验 dump 返回流内容
+static void *(*old_cntj)(void *, const MethodInfo *);
+static void *my_cntj(void *path, const MethodInfo *m) {
+    void *ret = old_cntj(path, m);
+    char s[256];
+    if (probe_read_string(path, s, sizeof(s)))
+        LOGI("【eti解密流】eti.cntj path=%s", s);
+    // MemoryStream 首引用字段(_buffer)通常在 0x10；严格校验失败即跳过，不影响游戏
+    if (ret) {
+        void *buf = *(void **)((char *)ret + 0x10);
+        uint8_t *d; int32_t l;
+        if (probe_read_array(buf, &d, &l) && l > 4096)
+            probe_dump_blob("/sdcard/Download/probe_eti_stream", "probe_eti_stream", d, l);
+    }
+    return ret;
+}
+
+// ---- C) RijndaelManaged.CreateDecryptor(key, iv)：BCL 兜底，直接拿 key/IV
+static void *(*old_CreateDecryptor)(void *, void *, void *, const MethodInfo *);
+static void *my_CreateDecryptor(void *__this, void *rgbKey, void *rgbIV, const MethodInfo *m) {
+    void *ret = old_CreateDecryptor(__this, rgbKey, rgbIV, m);
+    uint8_t *kd; int32_t kl;
+    if (probe_read_array(rgbKey, &kd, &kl)) {
+        // FNV1a 去重：同一 key 反复创建解密器不重复落盘
+        uint64_t h = 1469598103934665603ULL;
+        for (int32_t i = 0; i < kl; i++) { h ^= kd[i]; h *= 1099511628211ULL; }
+        bool fresh = false;
+        {
+            std::lock_guard<std::mutex> lk(g_rd_key_mutex);
+            fresh = g_rd_key_seen.insert(h).second;
+        }
+        if (fresh) {
+            LOGI("【BCL密钥】CreateDecryptor key[%d] 首见，已落盘", kl);
+            probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_bcl_key", kd, kl);
+        }
+    }
+    if (probe_read_array(rgbIV, &kd, &kl))
+        probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_bcl_iv", kd, kl);
+    return ret;
+}
+
+// ---- D) eti.cnto / bbm(pw)：1 参密码入口（cnto 与 bbm 签名相同，共用替换体）
+static void (*old_cnto)(void *, const MethodInfo *);
+static void my_cnto(void *pw, const MethodInfo *m) {
+    char s[256];
+    if (probe_read_string(pw, s, sizeof(s)))
+        LOGI("【密码入口】pw=%s", s);
+    if (pw) probe_dump_blob("/sdcard/Download/probe_eti_key", "probe_eti_pw",
+                            (char *)pw + 0x14,
+                            (size_t)*(int32_t *)((char *)pw + 0x10) * 2);
+    old_cnto(pw, m);
+}
+static void (*old_bbm)(void *, const MethodInfo *);
+
+static void install_table_path_probes() {
+    if (g_probes_done) return;
+    static bool a4 = false, a3 = false, b = false, c = false, d1 = false, d2 = false;
+    if (!a4)
+        a4 = hook_probe_method("", "eti", "cntp", 4,
+                               (void *)my_cntp4, (void **)&old_cntp4);
+    if (!a4 && !a3)
+        a3 = hook_probe_method("", "eti", "cntp", 3,
+                               (void *)my_cntp3, (void **)&old_cntp3);
+    if (!b)
+        b = hook_probe_method("", "eti", "cntj", 1,
+                              (void *)my_cntj, (void **)&old_cntj);
+    if (!c)
+        c = hook_probe_method("System.Security.Cryptography", "RijndaelManaged",
+                              "CreateDecryptor", 2,
+                              (void *)my_CreateDecryptor, (void **)&old_CreateDecryptor);
+    if (!d1)
+        d1 = hook_probe_method("", "eti", "cnto", 1,
+                               (void *)my_cnto, (void **)&old_cnto);
+    if (!d2)
+        d2 = hook_probe_method("", "eti", "bbm", 1,
+                               (void *)my_cnto, (void **)&old_bbm);
+    if (a4 + a3 + b + c + d1 + d2 > 0)
+        g_probes_done = true;   // 任一探针就位即视为完成（幂等护栏）
+    if (!a4 && !a3)
+        LOGI("【提示】eti.cntp 探针未就位（类名可能混淆变更）；BCL Rijndael 兜底 %s",
+             c ? "仍在" : "也未就位");
+}
+
 // ==================== 主入口 ====================
 
 void hack_start(const char *game_data_dir) {
@@ -1207,6 +1422,10 @@ void hack_start(const char *game_data_dir) {
             }
             if (!hooked)
                 LOGE("【错误】多次重试后仍未完成 hook 安装。");
+
+            // 表解密探针：抓密码/key/IV（静态解包用）。文本 hook 成功后 il2cpp
+            // 程序集必然已就绪，此时安装一次即可；失败安全不影响翻译。
+            install_table_path_probes();
 
             // 启动自动日志落盘：fork 子进程跑 logcat，把 chopperhl 标签日志写入
             // /sdcard/Download/chopperhl_log.txt，用户无需手动 adb logcat。
@@ -1450,11 +1669,18 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
 #endif
 }
 
+// root 版（Zygisk / NativeBridge 流程）需要本 JNI_OnLoad：x86 模拟器上 arm
+// 桥接库被 NativeBridgeLoad 以 getTrampoline("JNI_OnLoad") 方式调用，reserved
+// 携带 game_data_dir。免 root 独立版由 standalone_entry.cpp 提供自己的
+// JNI_OnLoad（System.loadLibrary 时 reserved 为 null，且需更早装 exit blocker、
+// 释放 assets 字典），此时用 HACK_STANDALONE 排除本实现避免符号冲突。
 #if defined(__arm__) || defined(__aarch64__)
+#ifndef HACK_STANDALONE
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     auto game_data_dir = (const char *)reserved;
     std::thread hack_thread(hack_start, game_data_dir);
     hack_thread.detach();
     return JNI_VERSION_1_6;
 }
+#endif
 #endif
